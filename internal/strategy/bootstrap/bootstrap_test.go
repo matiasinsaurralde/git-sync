@@ -499,6 +499,74 @@ func TestSubdivideCheckpoints(t *testing.T) {
 	})
 }
 
+func TestShouldAbortPush(t *testing.T) {
+	t.Parallel()
+	const cap500 = 500 * 1024 * 1024
+	cases := []struct {
+		name         string
+		bytesSent    int64
+		objectsSent  int64
+		totalObjects int64
+		budget       int64
+		want         bool
+	}{
+		{
+			name:   "no budget never aborts",
+			budget: 0, bytesSent: 1 << 30, want: false,
+		},
+		{
+			name:      "tiny upload below floor never aborts even at full budget",
+			bytesSent: 1024, budget: cap500, want: false,
+		},
+		{
+			// Header parsed, balanced pack, projection well under cap.
+			// 50 MiB sent for 25% of objects projects to 200 MiB total.
+			name:         "projection under threshold proceeds",
+			bytesSent:    50 * 1024 * 1024,
+			objectsSent:  25, totalObjects: 100,
+			budget: cap500, want: false,
+		},
+		{
+			// Cloudflare-shaped front-loaded pack: 50 MiB sent and only
+			// 5% of objects done means projected ≈ 1 GiB > 95% of cap.
+			name:         "front-loaded projection trips abort",
+			bytesSent:    50 * 1024 * 1024,
+			objectsSent:  5, totalObjects: 100,
+			budget: cap500, want: true,
+		},
+		{
+			// No object signal yet (header still in flight or scanner
+			// behind) — fall back to bytes ≥ 95% of budget.
+			name:      "no objects, simple threshold under budget",
+			bytesSent: 400 * 1024 * 1024,
+			budget:    cap500, want: false,
+		},
+		{
+			name:      "no objects, simple threshold over budget",
+			bytesSent: 480 * 1024 * 1024,
+			budget:    cap500, want: true,
+		},
+		{
+			// Late-stage projection: objectsSent has caught up with
+			// totalObjects so projection ≈ bytesSent. Must not flap.
+			name:         "near-end matched ratio projects to current bytes",
+			bytesSent:    450 * 1024 * 1024,
+			objectsSent:  98, totalObjects: 100,
+			budget: cap500, want: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			got := shouldAbortPush(c.bytesSent, c.objectsSent, c.totalObjects, c.budget)
+			if got != c.want {
+				t.Errorf("shouldAbortPush(%d, %d, %d, %d) = %v, want %v",
+					c.bytesSent, c.objectsSent, c.totalObjects, c.budget, got, c.want)
+			}
+		})
+	}
+}
+
 func TestObservedSubdivisionFactor(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

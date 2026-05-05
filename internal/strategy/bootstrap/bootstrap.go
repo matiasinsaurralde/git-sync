@@ -255,6 +255,15 @@ func executeBatched( //nolint:maintidx // complex batch logic is inherently bran
 	// p.TargetMaxPack — saving an entire ~limit-sized wasted upload.
 	calibratedBytesPerObject := int64(estimatedBytesPerObject)
 
+	// selfImposedBudget tracks the byte ceiling we use for mid-stream
+	// abort. Initialised from the user-supplied target limit; ratchets
+	// down each time we observe a smaller server-side cutoff (parsed
+	// 413 limit or, more commonly with reverse proxies that don't
+	// announce the limit in the response, the bytes we managed to send
+	// before the connection was cut). Re-used across attempts so every
+	// failed push refines the budget.
+	selfImposedBudget := p.TargetMaxPack
+
 	for _, batch := range batches {
 		if batch.subsumed {
 			cmds := []gitproto.PushCommand{{
@@ -402,12 +411,23 @@ func executeBatched( //nolint:maintidx // complex batch logic is inherently bran
 
 			cmds := convert.PlansToPushCommands(stagePlans)
 			observer := newPackStreamObserver(packReader)
+			if selfImposedBudget > 0 {
+				budget := selfImposedBudget
+				observer.SetAborter(func(bytesSent, objectsSent, totalObjects int64) bool {
+					return shouldAbortPush(bytesSent, objectsSent, totalObjects, budget)
+				})
+			}
 			pushErr := p.TargetPusher.PushPack(ctx, cmds, observer)
 			sentBytes := observer.Bytes()
 			objectsSent := observer.ObjectsSent()
 			totalObjects := observer.TotalObjects()
+			abortedEarly := observer.Aborted()
 			if pushErr != nil {
 				_ = packReader.Close()
+				// Treat abortedEarly the same as a body-limit error:
+				// both indicate "this pack is too big for the target",
+				// just one is detected by the server and one by us.
+				sizeIssue := abortedEarly || isTargetBodyLimitError(pushErr)
 				p.log("bootstrap batch push failed",
 					"branch", batch.Plan.TargetRef.String(),
 					"batch", idx+1,
@@ -418,12 +438,15 @@ func executeBatched( //nolint:maintidx // complex batch logic is inherently bran
 					"object_count", packObjectCount,
 					"objects_sent", objectsSent,
 					"total_objects_in_pack", totalObjects,
-					"will_subdivide", isTargetBodyLimitError(pushErr) && len(batch.chain) > 0,
+					"aborted_early", abortedEarly,
+					"will_subdivide", sizeIssue && len(batch.chain) > 0,
 					"error", pushErr.Error())
-				if isTargetBodyLimitError(pushErr) && len(batch.chain) > 0 {
+				if sizeIssue && len(batch.chain) > 0 {
 					limit := p.TargetMaxPack
 					if parsed := targetBodyLimit(pushErr); parsed > 0 {
 						limit = parsed
+					} else if abortedEarly && selfImposedBudget > 0 {
+						limit = selfImposedBudget
 					}
 					// Calibrate before subdividing. The new value carries
 					// over to the next iteration's pre-flight check, so a
@@ -437,6 +460,18 @@ func executeBatched( //nolint:maintidx // complex batch logic is inherently bran
 							"object_count", packObjectCount)
 						calibratedBytesPerObject = updated
 					}
+					// Refine the self-imposed budget from observation:
+					// take the lowest of (current, parsed-server-limit,
+					// observed-cutoff). The empirical sent-bytes cutoff
+					// is the only reliable signal when the server's 413
+					// body has no parseable limit (e.g. Cloudflare's
+					// HTML page), and it's strictly tighter than what
+					// we currently use.
+					if !abortedEarly && sentBytes > 0 {
+						if selfImposedBudget == 0 || sentBytes < selfImposedBudget {
+							selfImposedBudget = sentBytes
+						}
+					}
 					factor := observedSubdivisionFactor(sentBytes, limit)
 					expanded := subdivideToFactor(batch.chain, current, batch.Checkpoints[idx:], factor)
 					if len(expanded) > len(batch.Checkpoints[idx:]) {
@@ -449,13 +484,18 @@ func executeBatched( //nolint:maintidx // complex batch logic is inherently bran
 							"sent_bytes", sentBytes,
 							"limit_bytes", limit,
 							"factor", factor,
+							"aborted_early", abortedEarly,
 							"error", pushErr.Error())
 						limitText := ""
 						if limit > 0 {
 							limitText = fmt.Sprintf(" (target limit %s)", humanBytes(limit))
 						}
-						p.notice(fmt.Sprintf("target rejected pack%s — splitting %d → %d packs",
-							limitText, oldRemaining, newCount))
+						reason := "target rejected pack"
+						if abortedEarly {
+							reason = "projected to exceed target limit"
+						}
+						p.notice(fmt.Sprintf("%s%s — splitting %d → %d packs",
+							reason, limitText, oldRemaining, newCount))
 						batch.Checkpoints = append(batch.Checkpoints[:idx], expanded...)
 						continue // retry at same idx with new (smaller) checkpoint
 					}
@@ -838,6 +878,46 @@ func chainPosition(chain []plumbing.Hash, hash plumbing.Hash) int {
 		}
 	}
 	return -1
+}
+
+// minBytesBeforeAbort is the floor below which the projection-based
+// abort heuristic stays silent. The first few KB of a pack are header
+// + small objects; their bytes/object ratio doesn't represent the
+// rest. Waiting until at least this many bytes have flowed avoids
+// pathological "abort the second the header arrives" behaviour while
+// still cutting losses well before the configured budget is reached.
+const minBytesBeforeAbort = 8 * 1024 * 1024
+
+// shouldAbortPush decides whether an in-flight push has crossed the
+// "we are clearly going to overshoot the budget" threshold. Two
+// regimes:
+//
+//   - Pack header has been parsed (totalObjects > 0) AND at least one
+//     object has fully gone through (objectsSent > 0): project the
+//     final pack size as bytesSent × totalObjects ÷ objectsSent and
+//     abort if that projection exceeds budget × safety.
+//
+//   - Header not yet observed or no full object yet: fall back to a
+//     simple bytesSent ≥ budget × safety check. Catches the common
+//     "we have a budget from a prior 413, just don't send past it
+//     again" case before the parser has anything to say.
+//
+// Returns false until bytesSent crosses minBytesBeforeAbort so the
+// pack header alone never triggers an abort.
+func shouldAbortPush(bytesSent, objectsSent, totalObjects, budget int64) bool {
+	if budget <= 0 || bytesSent < minBytesBeforeAbort {
+		return false
+	}
+	const safety = 95 // percent of budget at which we cut
+	threshold := budget * safety / 100
+	if objectsSent > 0 && totalObjects > 0 {
+		// Guard against divide-by-zero and against late-stage spikes
+		// when objectsSent has caught up to totalObjects (projection
+		// becomes the current bytesSent itself, harmless).
+		projected := bytesSent * totalObjects / objectsSent
+		return projected > threshold
+	}
+	return bytesSent > threshold
 }
 
 // observedSubdivisionFactor estimates how many sub-packs a rejected

@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -147,6 +148,39 @@ func TestPackStreamObserverHeaderReadyEarly(t *testing.T) {
 	if _, err := io.Copy(io.Discard, o); err != nil {
 		t.Fatalf("drain: %v", err)
 	}
+}
+
+// TestPackStreamObserverAbortStopsRead verifies that once the aborter
+// returns true the observer surfaces ErrPackUploadAborted on every
+// subsequent Read, even though the underlying source still has bytes.
+// This is the contract the bootstrap loop relies on to short-circuit
+// a doomed upload.
+func TestPackStreamObserverAbortStopsRead(t *testing.T) {
+	t.Parallel()
+	pack, _ := buildSyntheticPack(t, 80)
+
+	o := newPackStreamObserver(io.NopCloser(bytes.NewReader(pack)))
+	defer func() { _ = o.Close() }()
+
+	// Trigger after the first 32 bytes pass through.
+	o.SetAborter(func(bytesSent, _, _ int64) bool {
+		return bytesSent >= 32
+	})
+
+	buf := make([]byte, 64)
+	for i := range 4 {
+		n, err := o.Read(buf)
+		if errors.Is(err, ErrPackUploadAborted) {
+			if !o.Aborted() {
+				t.Errorf("Aborted() must be true after the sentinel error fires")
+			}
+			return
+		}
+		if err != nil {
+			t.Fatalf("read %d returned %v (n=%d)", i, err, n)
+		}
+	}
+	t.Fatal("expected ErrPackUploadAborted within 4 reads")
 }
 
 // TestPackStreamObserverCloseBeforeFullRead ensures Close is safe even

@@ -10,6 +10,14 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/format/packfile"
 )
 
+// ErrPackUploadAborted is returned from packStreamObserver.Read when
+// the configured aborter says the upload is projected to exceed the
+// target body limit. Surfaces up through the HTTP transport as a
+// generic body-read error; bootstrap's push-failed branch checks the
+// observer's Aborted() flag to distinguish "we cut it" from a
+// server-side 413 / 500 / network failure.
+var ErrPackUploadAborted = errors.New("pack upload aborted early: projected to exceed target body limit")
+
 // packStreamObserver wraps the pack stream handed to PushPack with two
 // instruments:
 //
@@ -49,7 +57,18 @@ type packStreamObserver struct {
 	headerReady chan struct{}
 	done        chan struct{}
 	scannerErr  atomic.Pointer[error]
+
+	aborter aborterFunc
+	aborted atomic.Bool
 }
+
+// aborterFunc is consulted on every Read to decide whether the upload
+// should be cancelled mid-stream. Receives the latest counters so it
+// can project the final pack size from the bytes-per-object ratio so
+// far. Return true to abort the upload; the observer surfaces
+// ErrPackUploadAborted from its next Read and refuses to give up
+// further bytes.
+type aborterFunc func(bytesSent, objectsSent, totalObjects int64) bool
 
 func newPackStreamObserver(src io.ReadCloser) *packStreamObserver {
 	pr, pw := io.Pipe()
@@ -65,11 +84,36 @@ func newPackStreamObserver(src io.ReadCloser) *packStreamObserver {
 }
 
 func (o *packStreamObserver) Read(p []byte) (int, error) {
+	if o.aborted.Load() {
+		return 0, ErrPackUploadAborted
+	}
 	n, err := o.tee.Read(p)
 	if n > 0 {
 		o.bytes.Add(int64(n))
 	}
+	if err == nil && o.aborter != nil {
+		if o.aborter(o.bytes.Load(), o.objectsSent.Load(), o.totalObjects.Load()) {
+			o.aborted.Store(true)
+			return n, ErrPackUploadAborted
+		}
+	}
 	return n, err //nolint:wrapcheck // Read must preserve io.EOF for io.Reader contract
+}
+
+// SetAborter registers a function that decides, on each Read, whether
+// the upload should be cancelled mid-stream. Must be called before the
+// observer starts receiving Reads (i.e. before being handed to
+// PushPack); not safe to swap concurrently with active Reads.
+func (o *packStreamObserver) SetAborter(f aborterFunc) {
+	o.aborter = f
+}
+
+// Aborted reports whether the aborter triggered during this upload.
+// Stays true after the first abort even though subsequent Reads keep
+// returning the sentinel error; callers should check this flag to
+// distinguish a self-imposed early stop from a server-side 4xx/5xx.
+func (o *packStreamObserver) Aborted() bool {
+	return o.aborted.Load()
 }
 
 // Close releases the observer's pipe so the Scanner goroutine drains
