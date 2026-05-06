@@ -45,6 +45,28 @@ type AdvancedOptions struct {
 	BootstrapStrategy      string `json:"bootstrapStrategy,omitempty"`
 }
 
+// BootstrapStrategy values accepted by AdvancedOptions.BootstrapStrategy.
+// Empty is treated as the default (first-parent).
+const (
+	BootstrapStrategyFirstParent = "first-parent"
+	BootstrapStrategyTopo        = "topo"
+)
+
+// Validate rejects unknown values up front so callers don't have to
+// wait for the deep bootstrap planning path to surface them. It runs
+// on every request method regardless of whether the value will end
+// up being consulted, since silently accepting a typo on a
+// non-bootstrap path is worse than failing fast.
+func (o AdvancedOptions) Validate() error {
+	switch o.BootstrapStrategy {
+	case "", BootstrapStrategyFirstParent, BootstrapStrategyTopo:
+		return nil
+	default:
+		return fmt.Errorf("unsupported bootstrap strategy %q (want %q or %q)",
+			o.BootstrapStrategy, BootstrapStrategyFirstParent, BootstrapStrategyTopo)
+	}
+}
+
 type ProbeRequest struct {
 	Source      gitsync.Endpoint
 	Target      *gitsync.Endpoint
@@ -86,6 +108,9 @@ func New(opts Options) *Client {
 }
 
 func (c *Client) Probe(ctx context.Context, req ProbeRequest) (ProbeResult, error) {
+	if err := req.Options.Validate(); err != nil {
+		return ProbeResult{}, fmt.Errorf("probe: %w", err)
+	}
 	cfg, err := c.buildProbeConfig(ctx, req)
 	if err != nil {
 		return ProbeResult{}, err
@@ -98,6 +123,9 @@ func (c *Client) Probe(ctx context.Context, req ProbeRequest) (ProbeResult, erro
 }
 
 func (c *Client) Plan(ctx context.Context, req SyncRequest) (Result, error) {
+	if err := req.Options.Validate(); err != nil {
+		return Result{}, fmt.Errorf("plan: %w", err)
+	}
 	planReq := req
 	planReq.DryRun = true
 	cfg, err := c.buildSyncConfig(ctx, planReq)
@@ -112,6 +140,9 @@ func (c *Client) Plan(ctx context.Context, req SyncRequest) (Result, error) {
 }
 
 func (c *Client) Sync(ctx context.Context, req SyncRequest) (Result, error) {
+	if err := req.Options.Validate(); err != nil {
+		return Result{}, fmt.Errorf("sync: %w", err)
+	}
 	cfg, err := c.buildSyncConfig(ctx, req)
 	if err != nil {
 		return Result{}, err
@@ -124,6 +155,9 @@ func (c *Client) Sync(ctx context.Context, req SyncRequest) (Result, error) {
 }
 
 func (c *Client) Replicate(ctx context.Context, req SyncRequest) (Result, error) {
+	if err := req.Options.Validate(); err != nil {
+		return Result{}, fmt.Errorf("replicate: %w", err)
+	}
 	req.Policy.Mode = gitsync.ModeReplicate
 	cfg, err := c.buildSyncConfig(ctx, req)
 	if err != nil {
@@ -137,6 +171,9 @@ func (c *Client) Replicate(ctx context.Context, req SyncRequest) (Result, error)
 }
 
 func (c *Client) Bootstrap(ctx context.Context, req BootstrapRequest) (Result, error) {
+	if err := req.Options.Validate(); err != nil {
+		return Result{}, fmt.Errorf("bootstrap: %w", err)
+	}
 	cfg, err := c.buildBootstrapConfig(ctx, req)
 	if err != nil {
 		return Result{}, err
@@ -149,6 +186,9 @@ func (c *Client) Bootstrap(ctx context.Context, req BootstrapRequest) (Result, e
 }
 
 func (c *Client) Fetch(ctx context.Context, req FetchRequest) (FetchResult, error) {
+	if err := req.Options.Validate(); err != nil {
+		return FetchResult{}, fmt.Errorf("fetch: %w", err)
+	}
 	cfg, err := c.buildFetchConfig(ctx, req)
 	if err != nil {
 		return FetchResult{}, err
