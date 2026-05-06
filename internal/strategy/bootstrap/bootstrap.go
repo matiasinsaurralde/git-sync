@@ -442,9 +442,10 @@ func executeBatched( //nolint:maintidx // complex batch logic is inherently bran
 					"will_subdivide", sizeIssue && len(batch.chain) > 0,
 					"error", pushErr.Error())
 				if sizeIssue && len(batch.chain) > 0 {
+					parsedLimit := targetBodyLimit(pushErr)
 					limit := p.TargetMaxPack
-					if parsed := targetBodyLimit(pushErr); parsed > 0 {
-						limit = parsed
+					if parsedLimit > 0 {
+						limit = parsedLimit
 					} else if abortedEarly && selfImposedBudget > 0 {
 						limit = selfImposedBudget
 					}
@@ -475,18 +476,7 @@ func executeBatched( //nolint:maintidx // complex batch logic is inherently bran
 							"objects_sent", objectsSent)
 						calibratedBytesPerObject = updated
 					}
-					// Refine the self-imposed budget from observation:
-					// take the lowest of (current, parsed-server-limit,
-					// observed-cutoff). The empirical sent-bytes cutoff
-					// is the only reliable signal when the server's 413
-					// body has no parseable limit (e.g. Cloudflare's
-					// HTML page), and it's strictly tighter than what
-					// we currently use.
-					if !abortedEarly && sentBytes > 0 {
-						if selfImposedBudget == 0 || sentBytes < selfImposedBudget {
-							selfImposedBudget = sentBytes
-						}
-					}
+					selfImposedBudget = nextSelfImposedBudget(selfImposedBudget, parsedLimit, sentBytes, abortedEarly)
 					// Pick the byte count we use for sizing the next
 					// subdivision. When the server cut us off, sentBytes
 					// is roughly the cap and using it directly is right.
@@ -965,6 +955,38 @@ func shouldAbortPush(bytesSent, objectsSent, totalObjects, budget int64) bool {
 // rejection arrived comfortably under the limit (a server with
 // stricter limits announcing the failure early), 2× is enough since
 // sentBytes is closer to the real pack size.
+// nextSelfImposedBudget refines the in-flight self-imposed upload
+// ceiling after a server-rejected push (i.e. not one the client
+// aborted itself). It prefers the explicit body limit when the server
+// announced one — that's authoritative — and falls back to the
+// empirical sent-bytes cutoff only when no parseable limit is
+// available (e.g. Cloudflare's HTML 413). Reverse proxies sometimes
+// reject after only a few MiB even though the actual cap is much
+// higher; ratcheting to that early-cutoff would cause subsequent runs
+// to over-subdivide for no reason.
+//
+// The budget only ratchets down: if the new candidate isn't smaller
+// than the current ceiling, the current value stays.
+func nextSelfImposedBudget(current, parsedLimit, sentBytes int64, abortedEarly bool) int64 {
+	if abortedEarly {
+		return current
+	}
+	candidate := int64(0)
+	switch {
+	case parsedLimit > 0:
+		candidate = parsedLimit
+	case sentBytes > 0:
+		candidate = sentBytes
+	}
+	if candidate <= 0 {
+		return current
+	}
+	if current == 0 || candidate < current {
+		return candidate
+	}
+	return current
+}
+
 func observedSubdivisionFactor(sentBytes, limit int64) int {
 	if sentBytes <= 0 || limit <= 0 {
 		return 2

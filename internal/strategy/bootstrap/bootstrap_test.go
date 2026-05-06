@@ -567,6 +567,82 @@ func TestShouldAbortPush(t *testing.T) {
 	}
 }
 
+func TestNextSelfImposedBudget(t *testing.T) {
+	t.Parallel()
+	const oneHundredMiB = 100 * 1024 * 1024
+	const fiveMiB = 5 * 1024 * 1024
+	cases := []struct {
+		name         string
+		current      int64
+		parsedLimit  int64
+		sentBytes    int64
+		abortedEarly bool
+		want         int64
+	}{
+		{
+			// Self-aborted means we triggered the cut, not the server,
+			// so sentBytes is just the abort floor — never useful for
+			// ratcheting the budget.
+			name:    "self-aborted leaves budget unchanged",
+			current: oneHundredMiB, parsedLimit: 0, sentBytes: minBytesBeforeAbort,
+			abortedEarly: true, want: oneHundredMiB,
+		},
+		{
+			// The bug being fixed: a proxy rejected after 5 MiB but
+			// announced "body exceeded size limit 104857600". The
+			// authoritative number is the announced one — without
+			// this, the budget would ratchet to 5 MiB and over-
+			// subdivide forever after.
+			name:    "parsed limit beats sent bytes when both present",
+			current: 0, parsedLimit: oneHundredMiB, sentBytes: fiveMiB,
+			abortedEarly: false, want: oneHundredMiB,
+		},
+		{
+			// Cloudflare HTML 413: no parseable number, sentBytes is
+			// our only signal that the server hit its body cap.
+			name:    "sent bytes used when no parsed limit",
+			current: 0, parsedLimit: 0, sentBytes: fiveMiB,
+			abortedEarly: false, want: fiveMiB,
+		},
+		{
+			// Ratchet only goes down: a parsed limit larger than the
+			// current ceiling must be ignored — we already know a
+			// tighter bound from a previous run.
+			name:    "larger parsed limit ignored when current is tighter",
+			current: fiveMiB, parsedLimit: oneHundredMiB, sentBytes: 0,
+			abortedEarly: false, want: fiveMiB,
+		},
+		{
+			// Same invariant applied to the sent-bytes fallback.
+			name:    "larger sent bytes ignored when current is tighter",
+			current: fiveMiB, parsedLimit: 0, sentBytes: oneHundredMiB,
+			abortedEarly: false, want: fiveMiB,
+		},
+		{
+			// No signal at all: keep the current value.
+			name:    "no signal leaves budget unchanged",
+			current: oneHundredMiB, parsedLimit: 0, sentBytes: 0,
+			abortedEarly: false, want: oneHundredMiB,
+		},
+		{
+			// Initial budget zero accepts whichever signal is present.
+			name:    "zero current accepts parsed limit",
+			current: 0, parsedLimit: oneHundredMiB, sentBytes: 0,
+			abortedEarly: false, want: oneHundredMiB,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			got := nextSelfImposedBudget(c.current, c.parsedLimit, c.sentBytes, c.abortedEarly)
+			if got != c.want {
+				t.Errorf("nextSelfImposedBudget(%d, %d, %d, %v) = %d, want %d",
+					c.current, c.parsedLimit, c.sentBytes, c.abortedEarly, got, c.want)
+			}
+		})
+	}
+}
+
 func TestObservedSubdivisionFactor(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
