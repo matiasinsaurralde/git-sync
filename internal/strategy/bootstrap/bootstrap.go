@@ -255,6 +255,15 @@ func executeBatched( //nolint:maintidx // complex batch logic is inherently bran
 	// p.TargetMaxPack — saving an entire ~limit-sized wasted upload.
 	calibratedBytesPerObject := int64(estimatedBytesPerObject)
 
+	// selfImposedBudget tracks the byte ceiling we use for mid-stream
+	// abort. Initialised from the user-supplied target limit; ratchets
+	// down each time we observe a smaller server-side cutoff (parsed
+	// 413 limit or, more commonly with reverse proxies that don't
+	// announce the limit in the response, the bytes we managed to send
+	// before the connection was cut). Re-used across attempts so every
+	// failed push refines the budget.
+	selfImposedBudget := p.TargetMaxPack
+
 	for _, batch := range batches {
 		if batch.subsumed {
 			cmds := []gitproto.PushCommand{{
@@ -401,11 +410,24 @@ func executeBatched( //nolint:maintidx // complex batch logic is inherently bran
 				"calibrated_bytes_per_object", calibratedBytesPerObject)
 
 			cmds := convert.PlansToPushCommands(stagePlans)
-			counter := &packReadCounter{ReadCloser: packReader}
-			pushErr := p.TargetPusher.PushPack(ctx, cmds, counter)
-			sentBytes := counter.n
+			observer := newPackStreamObserver(packReader)
+			if selfImposedBudget > 0 {
+				budget := selfImposedBudget
+				observer.SetAborter(func(bytesSent, objectsSent, totalObjects int64) bool {
+					return shouldAbortPush(bytesSent, objectsSent, totalObjects, budget)
+				})
+			}
+			pushErr := p.TargetPusher.PushPack(ctx, cmds, observer)
+			sentBytes := observer.Bytes()
+			objectsSent := observer.ObjectsSent()
+			totalObjects := observer.TotalObjects()
+			abortedEarly := observer.Aborted()
 			if pushErr != nil {
 				_ = packReader.Close()
+				// Treat abortedEarly the same as a body-limit error:
+				// both indicate "this pack is too big for the target",
+				// just one is detected by the server and one by us.
+				sizeIssue := abortedEarly || isTargetBodyLimitError(pushErr)
 				p.log("bootstrap batch push failed",
 					"branch", batch.Plan.TargetRef.String(),
 					"batch", idx+1,
@@ -414,26 +436,70 @@ func executeBatched( //nolint:maintidx // complex batch logic is inherently bran
 					"target_limit_bytes", p.TargetMaxPack,
 					"sent_bytes", sentBytes,
 					"object_count", packObjectCount,
-					"will_subdivide", isTargetBodyLimitError(pushErr) && len(batch.chain) > 0,
+					"objects_sent", objectsSent,
+					"total_objects_in_pack", totalObjects,
+					"aborted_early", abortedEarly,
+					"will_subdivide", sizeIssue && len(batch.chain) > 0,
 					"error", pushErr.Error())
-				if isTargetBodyLimitError(pushErr) && len(batch.chain) > 0 {
+				if sizeIssue && len(batch.chain) > 0 {
+					parsedLimit := targetBodyLimit(pushErr)
 					limit := p.TargetMaxPack
-					if parsed := targetBodyLimit(pushErr); parsed > 0 {
-						limit = parsed
+					if parsedLimit > 0 {
+						limit = parsedLimit
+					} else if abortedEarly && selfImposedBudget > 0 {
+						limit = selfImposedBudget
 					}
 					// Calibrate before subdividing. The new value carries
 					// over to the next iteration's pre-flight check, so a
 					// blob-heavy repo's sub-packs get caught earlier.
-					if updated := calibrateBytesPerObject(sentBytes, packObjectCount, calibratedBytesPerObject); updated > 0 {
+					//
+					// When we have an objectsSent observation from the
+					// streaming parser, divide by THAT rather than the
+					// full pack header count. sentBytes covers exactly
+					// objectsSent objects (the front of the pack), so
+					// sentBytes/objectsSent is the accurate per-object
+					// average for the portion we actually observed —
+					// and for blob-front-loaded repos that's a pessimistic
+					// upper bound, which is what we want for pre-flight.
+					//
+					// When the header was parsed but no object completed
+					// (a single front-loaded large blob exhausted the
+					// abort floor), treat it as one observed object: we
+					// know that first object alone consumed sentBytes,
+					// which is the right pessimistic per-object input.
+					effObjectsSent := effectiveObjectsSent(objectsSent, totalObjects, abortedEarly)
+					calibrationDenom := packObjectCount
+					if effObjectsSent > 0 && effObjectsSent < calibrationDenom {
+						calibrationDenom = effObjectsSent
+					}
+					if updated := calibrateBytesPerObject(sentBytes, calibrationDenom, calibratedBytesPerObject); updated > 0 {
 						p.log("bootstrap batch calibrated bytes-per-object",
 							"branch", batch.Plan.TargetRef.String(),
 							"previous_bytes_per_object", calibratedBytesPerObject,
 							"observed_bytes_per_object", updated,
 							"sent_bytes", sentBytes,
-							"object_count", packObjectCount)
+							"calibration_denom", calibrationDenom,
+							"object_count", packObjectCount,
+							"objects_sent", objectsSent)
 						calibratedBytesPerObject = updated
 					}
-					factor := observedSubdivisionFactor(sentBytes, limit)
+					selfImposedBudget = nextSelfImposedBudget(selfImposedBudget, parsedLimit, sentBytes, abortedEarly)
+					// Pick the byte count we use for sizing the next
+					// subdivision. When the server cut us off, sentBytes
+					// is roughly the cap and using it directly is right.
+					// When *we* cut the upload early, sentBytes is just
+					// the abort point (~minBytesBeforeAbort) — much less
+					// than the real pack size — so the factor would
+					// converge slowly. Project from observed bytes/object
+					// to the full pack size when we have the data, so
+					// factor reflects the real overshoot.
+					sizingBytes := sentBytes
+					if abortedEarly && totalObjects > 0 && effObjectsSent > 0 {
+						if projected := sentBytes * totalObjects / effObjectsSent; projected > sizingBytes {
+							sizingBytes = projected
+						}
+					}
+					factor := observedSubdivisionFactor(sizingBytes, limit)
 					expanded := subdivideToFactor(batch.chain, current, batch.Checkpoints[idx:], factor)
 					if len(expanded) > len(batch.Checkpoints[idx:]) {
 						oldRemaining := len(batch.Checkpoints[idx:])
@@ -443,15 +509,21 @@ func executeBatched( //nolint:maintidx // complex batch logic is inherently bran
 							"old_remaining", oldRemaining,
 							"new_remaining", newCount,
 							"sent_bytes", sentBytes,
+							"sizing_bytes", sizingBytes,
 							"limit_bytes", limit,
 							"factor", factor,
+							"aborted_early", abortedEarly,
 							"error", pushErr.Error())
 						limitText := ""
 						if limit > 0 {
 							limitText = fmt.Sprintf(" (target limit %s)", humanBytes(limit))
 						}
-						p.notice(fmt.Sprintf("target rejected pack%s — splitting %d → %d packs",
-							limitText, oldRemaining, newCount))
+						reason := "target rejected pack"
+						if abortedEarly {
+							reason = "projected to exceed target limit"
+						}
+						p.notice(fmt.Sprintf("%s%s — splitting %d → %d packs",
+							reason, limitText, oldRemaining, newCount))
 						batch.Checkpoints = append(batch.Checkpoints[:idx], expanded...)
 						continue // retry at same idx with new (smaller) checkpoint
 					}
@@ -750,7 +822,7 @@ const estimatedBytesPerObject = 750
 // bytesPerObject lets the caller use a per-run calibrated value
 // instead of the static estimatedBytesPerObject default. Calibrating
 // after each rejection (using the bytes that flowed through
-// packReadCounter) catches blob-heavy repos where the static 750-byte
+// packStreamObserver) catches blob-heavy repos where the static 750-byte
 // average is 10–20× too low — without calibration the pre-flight
 // would let oversized sub-packs through and the loop would only learn
 // after another wasted ~limit-sized upload. The subdivide callback
@@ -836,23 +908,72 @@ func chainPosition(chain []plumbing.Hash, hash plumbing.Hash) int {
 	return -1
 }
 
-// packReadCounter wraps the pack stream handed to PushPack so the
-// bootstrap loop can learn how many bytes actually went up before a 413
-// from the target. Used to size the post-rejection subdivision based on
-// observed reality rather than blindly halving — for a repo whose pack
-// is 20× larger than the per-object heuristic predicted, halving five
-// times in a row (1 → 2 → 4 → 8 → 16 → 32) is the same number of source
-// re-fetches as one informed jump from 1 → 32.
-type packReadCounter struct {
-	io.ReadCloser
+// minBytesBeforeAbort is the floor below which the projection-based
+// abort heuristic stays silent. The first few KB of a pack are header
+// + small objects; their bytes/object ratio doesn't represent the
+// rest. Waiting until at least this many bytes have flowed avoids
+// pathological "abort the second the header arrives" behaviour while
+// still cutting losses well before the configured budget is reached.
+const minBytesBeforeAbort = 8 * 1024 * 1024
 
-	n int64
+// shouldAbortPush decides whether an in-flight push has crossed the
+// "we are clearly going to overshoot the budget" threshold. Two
+// regimes:
+//
+//   - Pack header has been parsed (totalObjects > 0) AND at least one
+//     object has fully gone through (objectsSent > 0): project the
+//     final pack size as bytesSent × totalObjects ÷ objectsSent and
+//     abort if that projection exceeds budget × safety.
+//
+//   - Header not yet observed or no full object yet: fall back to a
+//     simple bytesSent ≥ budget × safety check. Catches the common
+//     "we have a budget from a prior 413, just don't send past it
+//     again" case before the parser has anything to say.
+//
+// effectiveObjectsSent returns the divisor used for post-failure
+// calibration and projection. When the upload self-aborted after
+// the pack header was parsed but before any object completed, the
+// observer reports objectsSent == 0 — yet the partially-observed
+// first object alone consumed sentBytes worth of upload, so a
+// pessimistic-but-bounded estimate treats it as one observation
+// instead of falling back to the full pack header count (which
+// would understate per-object size and produce a factor of 2,
+// recreating the slow 1→2→4→… convergence streaming-pack-parse is
+// trying to remove). Returns objectsSent as-is otherwise, which
+// may itself be zero when the header hasn't been parsed.
+func effectiveObjectsSent(objectsSent, totalObjects int64, abortedEarly bool) int64 {
+	if objectsSent == 0 && totalObjects > 0 && abortedEarly {
+		return 1
+	}
+	return objectsSent
 }
 
-func (c *packReadCounter) Read(p []byte) (int, error) {
-	n, err := c.ReadCloser.Read(p)
-	c.n += int64(n)
-	return n, err //nolint:wrapcheck // Read must preserve io.EOF for io.Reader contract
+// minBytesBeforeAbort gates only the projection path: the pack header
+// alone shouldn't be allowed to project a doomed upload off the noise
+// of the first KB. The absolute "we already crossed the budget"
+// trigger fires regardless of the floor — once the server (or a
+// learned proxy cutoff) said the cap is N and we've sent ≥ N, there
+// is nothing left to learn by sending more.
+func shouldAbortPush(bytesSent, objectsSent, totalObjects, budget int64) bool {
+	if budget <= 0 {
+		return false
+	}
+	const safety = 95 // percent of budget at which we cut
+	threshold := budget * safety / 100
+	if bytesSent >= threshold {
+		return true
+	}
+	if bytesSent < minBytesBeforeAbort {
+		return false
+	}
+	if objectsSent > 0 && totalObjects > 0 {
+		// Guard against divide-by-zero and against late-stage spikes
+		// when objectsSent has caught up to totalObjects (projection
+		// becomes the current bytesSent itself, harmless).
+		projected := bytesSent * totalObjects / objectsSent
+		return projected > threshold
+	}
+	return false
 }
 
 // observedSubdivisionFactor estimates how many sub-packs a rejected
@@ -869,6 +990,38 @@ func (c *packReadCounter) Read(p []byte) (int, error) {
 // rejection arrived comfortably under the limit (a server with
 // stricter limits announcing the failure early), 2× is enough since
 // sentBytes is closer to the real pack size.
+// nextSelfImposedBudget refines the in-flight self-imposed upload
+// ceiling after a server-rejected push (i.e. not one the client
+// aborted itself). It prefers the explicit body limit when the server
+// announced one — that's authoritative — and falls back to the
+// empirical sent-bytes cutoff only when no parseable limit is
+// available (e.g. Cloudflare's HTML 413). Reverse proxies sometimes
+// reject after only a few MiB even though the actual cap is much
+// higher; ratcheting to that early-cutoff would cause subsequent runs
+// to over-subdivide for no reason.
+//
+// The budget only ratchets down: if the new candidate isn't smaller
+// than the current ceiling, the current value stays.
+func nextSelfImposedBudget(current, parsedLimit, sentBytes int64, abortedEarly bool) int64 {
+	if abortedEarly {
+		return current
+	}
+	candidate := int64(0)
+	switch {
+	case parsedLimit > 0:
+		candidate = parsedLimit
+	case sentBytes > 0:
+		candidate = sentBytes
+	}
+	if candidate <= 0 {
+		return current
+	}
+	if current == 0 || candidate < current {
+		return candidate
+	}
+	return current
+}
+
 func observedSubdivisionFactor(sentBytes, limit int64) int {
 	if sentBytes <= 0 || limit <= 0 {
 		return 2

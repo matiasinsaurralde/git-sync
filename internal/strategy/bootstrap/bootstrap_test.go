@@ -499,6 +499,221 @@ func TestSubdivideCheckpoints(t *testing.T) {
 	})
 }
 
+func TestShouldAbortPush(t *testing.T) {
+	t.Parallel()
+	const cap500 = 500 * 1024 * 1024
+	cases := []struct {
+		name         string
+		bytesSent    int64
+		objectsSent  int64
+		totalObjects int64
+		budget       int64
+		want         bool
+	}{
+		{
+			name:   "no budget never aborts",
+			budget: 0, bytesSent: 1 << 30, want: false,
+		},
+		{
+			name:      "tiny upload below floor never aborts even at full budget",
+			bytesSent: 1024, budget: cap500, want: false,
+		},
+		{
+			// Header parsed, balanced pack, projection well under cap.
+			// 50 MiB sent for 25% of objects projects to 200 MiB total.
+			name:        "projection under threshold proceeds",
+			bytesSent:   50 * 1024 * 1024,
+			objectsSent: 25, totalObjects: 100,
+			budget: cap500, want: false,
+		},
+		{
+			// Cloudflare-shaped front-loaded pack: 50 MiB sent and only
+			// 5% of objects done means projected ≈ 1 GiB > 95% of cap.
+			name:        "front-loaded projection trips abort",
+			bytesSent:   50 * 1024 * 1024,
+			objectsSent: 5, totalObjects: 100,
+			budget: cap500, want: true,
+		},
+		{
+			// No object signal yet (header still in flight or scanner
+			// behind) — fall back to bytes ≥ 95% of budget.
+			name:      "no objects, simple threshold under budget",
+			bytesSent: 400 * 1024 * 1024,
+			budget:    cap500, want: false,
+		},
+		{
+			name:      "no objects, simple threshold over budget",
+			bytesSent: 480 * 1024 * 1024,
+			budget:    cap500, want: true,
+		},
+		{
+			// Late-stage projection: objectsSent has caught up with
+			// totalObjects so projection ≈ bytesSent. Must not flap.
+			name:        "near-end matched ratio projects to current bytes",
+			bytesSent:   450 * 1024 * 1024,
+			objectsSent: 98, totalObjects: 100,
+			budget: cap500, want: false,
+		},
+		{
+			// Learned proxy budget below the projection-path floor:
+			// the simple "we already crossed the threshold" check
+			// must still fire, otherwise client-side abort never
+			// triggers and every retry pays for full server-side
+			// rejection.
+			name:      "small budget under floor, sent crosses threshold",
+			bytesSent: 5 * 1024 * 1024,
+			budget:    5 * 1024 * 1024, want: true,
+		},
+		{
+			// Same small budget but well under threshold (95% of 5
+			// MiB ≈ 4.75 MiB). The floor still sensibly suppresses
+			// projection-based aborts.
+			name:      "small budget under floor, sent under threshold",
+			bytesSent: 1 * 1024 * 1024,
+			budget:    5 * 1024 * 1024, want: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			got := shouldAbortPush(c.bytesSent, c.objectsSent, c.totalObjects, c.budget)
+			if got != c.want {
+				t.Errorf("shouldAbortPush(%d, %d, %d, %d) = %v, want %v",
+					c.bytesSent, c.objectsSent, c.totalObjects, c.budget, got, c.want)
+			}
+		})
+	}
+}
+
+func TestEffectiveObjectsSent(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name         string
+		objectsSent  int64
+		totalObjects int64
+		abortedEarly bool
+		want         int64
+	}{
+		{
+			// Header parsed, the abort floor (8 MiB) was exhausted by
+			// a single front-loaded large blob before it finished
+			// scanning. The bug: without effective=1, calibration
+			// divides sentBytes by the full pack count and projection
+			// stays at sentBytes — the factor calculation collapses
+			// back to ~2 every retry, recreating the slow 1→2→4→…
+			// convergence streaming-pack-parse is meant to remove.
+			name:        "front-loaded blob abort treats first object as observed",
+			objectsSent: 0, totalObjects: 100,
+			abortedEarly: true, want: 1,
+		},
+		{
+			name:        "no header parsed leaves zero",
+			objectsSent: 0, totalObjects: 0,
+			abortedEarly: true, want: 0,
+		},
+		{
+			// Server-side rejection (not self-aborted): we don't
+			// invent an observation, since sentBytes here is the
+			// server's actual cutoff rather than our floor. Falling
+			// back to packObjectCount is the right divisor.
+			name:        "header parsed but server-rejected, no synthetic observation",
+			objectsSent: 0, totalObjects: 100,
+			abortedEarly: false, want: 0,
+		},
+		{
+			name:        "actual observation passes through",
+			objectsSent: 12, totalObjects: 100,
+			abortedEarly: true, want: 12,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			got := effectiveObjectsSent(c.objectsSent, c.totalObjects, c.abortedEarly)
+			if got != c.want {
+				t.Errorf("effectiveObjectsSent(%d, %d, %v) = %d, want %d",
+					c.objectsSent, c.totalObjects, c.abortedEarly, got, c.want)
+			}
+		})
+	}
+}
+
+func TestNextSelfImposedBudget(t *testing.T) {
+	t.Parallel()
+	const oneHundredMiB = 100 * 1024 * 1024
+	const fiveMiB = 5 * 1024 * 1024
+	cases := []struct {
+		name         string
+		current      int64
+		parsedLimit  int64
+		sentBytes    int64
+		abortedEarly bool
+		want         int64
+	}{
+		{
+			// Self-aborted means we triggered the cut, not the server,
+			// so sentBytes is just the abort floor — never useful for
+			// ratcheting the budget.
+			name:    "self-aborted leaves budget unchanged",
+			current: oneHundredMiB, parsedLimit: 0, sentBytes: minBytesBeforeAbort,
+			abortedEarly: true, want: oneHundredMiB,
+		},
+		{
+			// The bug being fixed: a proxy rejected after 5 MiB but
+			// announced "body exceeded size limit 104857600". The
+			// authoritative number is the announced one — without
+			// this, the budget would ratchet to 5 MiB and over-
+			// subdivide forever after.
+			name:    "parsed limit beats sent bytes when both present",
+			current: 0, parsedLimit: oneHundredMiB, sentBytes: fiveMiB,
+			abortedEarly: false, want: oneHundredMiB,
+		},
+		{
+			// Cloudflare HTML 413: no parseable number, sentBytes is
+			// our only signal that the server hit its body cap.
+			name:    "sent bytes used when no parsed limit",
+			current: 0, parsedLimit: 0, sentBytes: fiveMiB,
+			abortedEarly: false, want: fiveMiB,
+		},
+		{
+			// Ratchet only goes down: a parsed limit larger than the
+			// current ceiling must be ignored — we already know a
+			// tighter bound from a previous run.
+			name:    "larger parsed limit ignored when current is tighter",
+			current: fiveMiB, parsedLimit: oneHundredMiB, sentBytes: 0,
+			abortedEarly: false, want: fiveMiB,
+		},
+		{
+			// Same invariant applied to the sent-bytes fallback.
+			name:    "larger sent bytes ignored when current is tighter",
+			current: fiveMiB, parsedLimit: 0, sentBytes: oneHundredMiB,
+			abortedEarly: false, want: fiveMiB,
+		},
+		{
+			// No signal at all: keep the current value.
+			name:    "no signal leaves budget unchanged",
+			current: oneHundredMiB, parsedLimit: 0, sentBytes: 0,
+			abortedEarly: false, want: oneHundredMiB,
+		},
+		{
+			// Initial budget zero accepts whichever signal is present.
+			name:    "zero current accepts parsed limit",
+			current: 0, parsedLimit: oneHundredMiB, sentBytes: 0,
+			abortedEarly: false, want: oneHundredMiB,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			got := nextSelfImposedBudget(c.current, c.parsedLimit, c.sentBytes, c.abortedEarly)
+			if got != c.want {
+				t.Errorf("nextSelfImposedBudget(%d, %d, %d, %v) = %d, want %d",
+					c.current, c.parsedLimit, c.sentBytes, c.abortedEarly, got, c.want)
+			}
+		})
+	}
+}
+
 func TestObservedSubdivisionFactor(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -638,19 +853,25 @@ func TestSubdivideToFactorReturnsInputWhenChainExhausted(t *testing.T) {
 	}
 }
 
-func TestPackReadCounterTracksBytes(t *testing.T) {
+func TestPackStreamObserverTracksBytes(t *testing.T) {
 	t.Parallel()
 	body := []byte("a packfile worth of bytes")
-	c := &packReadCounter{ReadCloser: io.NopCloser(bytes.NewReader(body))}
-	out, err := io.ReadAll(c)
+	o := newPackStreamObserver(io.NopCloser(bytes.NewReader(body)))
+	out, err := io.ReadAll(o)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
 	if string(out) != string(body) {
-		t.Errorf("counter must not alter content: got %q", out)
+		t.Errorf("observer must not alter content: got %q", out)
 	}
-	if c.n != int64(len(body)) {
-		t.Errorf("counter.n = %d, want %d", c.n, len(body))
+	if o.Bytes() != int64(len(body)) {
+		t.Errorf("observer.Bytes() = %d, want %d", o.Bytes(), len(body))
+	}
+	// Cleanly drains the Scanner goroutine. Closing twice should be
+	// a no-op (the source is the closed io.NopCloser wrapping a
+	// bytes.Reader).
+	if err := o.Close(); err != nil {
+		t.Fatalf("close: %v", err)
 	}
 }
 
