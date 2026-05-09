@@ -2780,6 +2780,73 @@ func TestRun_IntegrationAddHistoricalAnnotatedTagAfterInitialBranchSync_NoThinTa
 	}
 }
 
+// TestRun_IntegrationAllRefsBootstrapsCustomNamespace verifies that AllRefs
+// expands the desired set to include refs outside refs/heads/ and refs/tags/
+// (here: refs/notes/) and that a bootstrap into an empty target mirrors them.
+func TestRun_IntegrationAllRefsBootstrapsCustomNamespace(t *testing.T) {
+	sourceRepo, sourceFS := newSourceRepo(t)
+	makeCommits(t, sourceRepo, sourceFS, 2)
+
+	head, err := sourceRepo.Reference(plumbing.NewBranchReferenceName(testBranch), true)
+	if err != nil {
+		t.Fatalf("resolve source head: %v", err)
+	}
+	notesRef := plumbing.ReferenceName("refs/notes/commits")
+	if err := sourceRepo.Storer.SetReference(plumbing.NewHashReference(notesRef, head.Hash())); err != nil {
+		t.Fatalf("set source notes ref: %v", err)
+	}
+
+	targetRepo, err := git.Init(memory.NewStorage())
+	if err != nil {
+		t.Fatalf("init target repo: %v", err)
+	}
+
+	sourceServer := newSmartHTTPRepoServerV2(t, sourceRepo)
+	targetServer := newSmartHTTPRepoServer(t, targetRepo)
+	defer sourceServer.Close()
+	defer targetServer.Close()
+
+	result, err := Run(context.Background(), Config{
+		Source:       Endpoint{URL: sourceServer.RepoURL()},
+		Target:       Endpoint{URL: targetServer.RepoURL()},
+		ProtocolMode: protocolModeV2,
+		AllRefs:      true,
+	})
+	if err != nil {
+		t.Fatalf("all-refs sync failed: %v", err)
+	}
+	if result.Pushed == 0 {
+		t.Fatalf("expected at least one ref pushed, got %+v", result)
+	}
+
+	gotNotes, err := targetRepo.Reference(notesRef, true)
+	if err != nil {
+		t.Fatalf("expected refs/notes/commits on target: %v", err)
+	}
+	if gotNotes.Hash() != head.Hash() {
+		t.Fatalf("target notes hash = %s, want %s", gotNotes.Hash(), head.Hash())
+	}
+	assertHeadsMatch(t, sourceRepo, targetRepo, testBranch)
+}
+
+// TestRun_IntegrationAllRefsRejectsCustomMappingWithoutAllRefs locks in the
+// validation gate: mapping a non-branch/non-tag ref errors when AllRefs is
+// not set, so the strict default flow stays loud about unsupported refs.
+func TestRun_IntegrationAllRefsRejectsCustomMappingWithoutAllRefs(t *testing.T) {
+	_, err := Run(context.Background(), Config{
+		Source:       Endpoint{URL: "https://example.invalid/source.git"},
+		Target:       Endpoint{URL: "https://example.invalid/target.git"},
+		ProtocolMode: protocolModeAuto,
+		Mappings:     []RefMapping{{Source: "refs/notes/commits", Target: "refs/notes/mirror"}},
+	})
+	if err == nil {
+		t.Fatal("expected error when mapping refs/notes/* without AllRefs")
+	}
+	if !strings.Contains(err.Error(), "unsupported source ref kind") {
+		t.Fatalf("expected unsupported-kind error, got %v", err)
+	}
+}
+
 func newSourceRepo(t *testing.T) (*git.Repository, billy.Filesystem) {
 	return syncertest.NewMemoryRepo(t)
 }

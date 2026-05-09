@@ -226,21 +226,25 @@ func executeBatched( //nolint:maintidx // complex batch logic is inherently bran
 	}
 
 	planRefs := make([]planner.DesiredRef, 0, len(plans))
-	tagPlans := make([]planner.BranchPlan, 0, len(plans))
-	tagDesired := make(map[plumbing.ReferenceName]gitproto.DesiredRef)
+	// Tags and other-kind refs (notes, pulls, custom namespaces) are pushed
+	// in a single create-only phase after the branch batches finish — they
+	// don't need checkpointing because they're create-only and reuse the
+	// branch-tip haves already on the target.
+	tailPlans := make([]planner.BranchPlan, 0, len(plans))
+	tailDesired := make(map[plumbing.ReferenceName]gitproto.DesiredRef)
 	for _, plan := range plans {
-		if plan.Kind == planner.RefKindTag {
-			tagPlans = append(tagPlans, plan)
+		if plan.Kind == planner.RefKindTag || plan.Kind == planner.RefKindOther {
+			tailPlans = append(tailPlans, plan)
 			if d, ok := p.DesiredRefs[plan.TargetRef]; ok {
-				tagDesired[plan.TargetRef] = gitproto.DesiredRef{
+				tailDesired[plan.TargetRef] = gitproto.DesiredRef{
 					SourceRef: d.SourceRef, TargetRef: d.TargetRef,
-					SourceHash: d.SourceHash, IsTag: true,
+					SourceHash: d.SourceHash, IsTag: plan.Kind == planner.RefKindTag,
 				}
 			}
 			continue
 		}
 		if !plan.SourceRef.IsBranch() || !plan.TargetRef.IsBranch() {
-			return result, errors.New("bootstrap batching currently supports branch refs and create-only tags")
+			return result, errors.New("bootstrap batching currently supports branch refs, tags, and other-kind create-only refs")
 		}
 		planRefs = append(planRefs, p.DesiredRefs[plan.TargetRef])
 	}
@@ -622,33 +626,33 @@ func executeBatched( //nolint:maintidx // complex batch logic is inherently bran
 		p.log("bootstrap batch branch finalized", "branch", batch.Plan.TargetRef.String())
 	}
 
-	// Tag phase (issue #1)
-	if len(tagPlans) > 0 {
-		p.log("bootstrap batch pushing tags after branch batches", "tag_count", len(tagPlans))
+	// Tail phase: tags and other-kind refs (issue #1)
+	if len(tailPlans) > 0 {
+		p.log("bootstrap batch pushing tail refs after branch batches", "tail_count", len(tailPlans))
 		if p.OnPhase != nil {
 			p.OnPhase("pushing tags")
 		}
-		tagTargetRefs := planner.CopyRefHashMap(p.TargetRefs)
+		tailTargetRefs := planner.CopyRefHashMap(p.TargetRefs)
 		for _, batch := range batches {
-			tagTargetRefs[batch.Plan.TargetRef] = batch.Plan.SourceHash
+			tailTargetRefs[batch.Plan.TargetRef] = batch.Plan.SourceHash
 		}
-		packReader, err := p.SourceService.FetchPack(ctx, p.SourceConn, tagDesired, tagTargetRefs)
+		packReader, err := p.SourceService.FetchPack(ctx, p.SourceConn, tailDesired, tailTargetRefs)
 		if err != nil {
 			if errors.Is(err, git.NoErrAlreadyUpToDate) {
-				cmds := convert.PlansToPushCommands(tagPlans)
+				cmds := convert.PlansToPushCommands(tailPlans)
 				if err := p.TargetPusher.PushCommands(ctx, cmds); err != nil {
-					return result, fmt.Errorf("create tag refs after bootstrap: %w", err)
+					return result, fmt.Errorf("create tail refs after bootstrap: %w", err)
 				}
 			} else {
-				return result, fmt.Errorf("fetch bootstrap tag pack: %w", err)
+				return result, fmt.Errorf("fetch bootstrap tail pack: %w", err)
 			}
 		} else {
 			packReader = gitproto.LimitPackReader(packReader, p.MaxPackBytes)
 			packReader = closeOnce(packReader)
-			cmds := convert.PlansToPushCommands(tagPlans)
+			cmds := convert.PlansToPushCommands(tailPlans)
 			if err := p.TargetPusher.PushPack(ctx, cmds, packReader); err != nil {
 				_ = packReader.Close()
-				return result, fmt.Errorf("push bootstrap tags: %w", err)
+				return result, fmt.Errorf("push bootstrap tail refs: %w", err)
 			}
 			_ = packReader.Close()
 		}
