@@ -301,14 +301,19 @@ func PlanRef(store storer.EncodedObjectStorer, want DesiredRef, targetHash plumb
 		return plan, nil
 	}
 
-	if want.Kind == RefKindTag {
+	// Tags and other-kind refs (notes, pulls, custom namespaces) don't
+	// generally form fast-forward chains — a notes append creates a new
+	// commit that isn't an ancestor of the previous notes tip. Treat
+	// them the same way: require --force to retarget rather than
+	// running an ancestry check that would always fail.
+	if want.Kind == RefKindTag || want.Kind == RefKindOther {
 		if force {
 			plan.Action = ActionUpdate
-			plan.Reason = ShortHash(targetHash) + " -> " + ShortHash(want.SourceHash) + " (force tag update)"
+			plan.Reason = ShortHash(targetHash) + " -> " + ShortHash(want.SourceHash) + " (force " + string(want.Kind) + " update)"
 			return plan, nil
 		}
 		plan.Action = ActionBlock
-		plan.Reason = ShortHash(targetHash) + " differs from " + ShortHash(want.SourceHash) + "; use --force to retarget tag"
+		plan.Reason = ShortHash(targetHash) + " differs from " + ShortHash(want.SourceHash) + "; use --force to update " + string(want.Kind) + " ref " + want.TargetRef.String()
 		return plan, nil
 	}
 

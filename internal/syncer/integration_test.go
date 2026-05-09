@@ -3050,6 +3050,85 @@ func TestBootstrap_IntegrationAllRefsBatchedTailPhase(t *testing.T) {
 	assertHeadsMatch(t, sourceRepo, targetRepo, testBranch)
 }
 
+// Other-kind refs don't have FF semantics (a notes append is rarely an
+// ancestor of the previous notes tip), so PlanRef requires --force to
+// retarget them — same as tags. This pins the block reason and the
+// successful update under --force.
+func TestRun_IntegrationAllRefsSyncOtherKindUpdateRequiresForce(t *testing.T) {
+	sourceRepo, sourceFS := newSourceRepo(t)
+	makeCommits(t, sourceRepo, sourceFS, 1)
+	firstHead, err := sourceRepo.Reference(plumbing.NewBranchReferenceName(testBranch), true)
+	if err != nil {
+		t.Fatalf("resolve first head: %v", err)
+	}
+	notesRef := plumbing.ReferenceName("refs/notes/commits")
+	if err := sourceRepo.Storer.SetReference(plumbing.NewHashReference(notesRef, firstHead.Hash())); err != nil {
+		t.Fatalf("set source notes ref: %v", err)
+	}
+
+	targetRepo, err := git.Init(memory.NewStorage())
+	if err != nil {
+		t.Fatalf("init target repo: %v", err)
+	}
+	sourceServer := newSmartHTTPRepoServerV2(t, sourceRepo)
+	targetServer := newSmartHTTPRepoServer(t, targetRepo)
+	defer sourceServer.Close()
+	defer targetServer.Close()
+
+	cfg := Config{
+		Source:       Endpoint{URL: sourceServer.RepoURL()},
+		Target:       Endpoint{URL: targetServer.RepoURL()},
+		ProtocolMode: protocolModeAuto,
+		AllRefs:      true,
+	}
+	if _, err := Run(context.Background(), cfg); err != nil {
+		t.Fatalf("initial all-refs sync failed: %v", err)
+	}
+
+	// Move the notes ref to a new, non-ancestor commit and try a plain sync.
+	makeCommits(t, sourceRepo, sourceFS, 1)
+	newHead, err := sourceRepo.Reference(plumbing.NewBranchReferenceName(testBranch), true)
+	if err != nil {
+		t.Fatalf("resolve new head: %v", err)
+	}
+	if err := sourceRepo.Storer.SetReference(plumbing.NewHashReference(notesRef, newHead.Hash())); err != nil {
+		t.Fatalf("update source notes ref: %v", err)
+	}
+
+	result, err := Run(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("expected sync to block on non-ancestor other-kind update")
+	}
+	var notesPlan *BranchPlan
+	for i := range result.Plans {
+		if result.Plans[i].TargetRef == notesRef {
+			notesPlan = &result.Plans[i]
+		}
+	}
+	if notesPlan == nil {
+		t.Fatalf("expected notes ref plan in result, got %+v", result.Plans)
+	}
+	if notesPlan.Action != ActionBlock {
+		t.Errorf("expected notes ref Action=%s, got %s", ActionBlock, notesPlan.Action)
+	}
+	if !strings.Contains(notesPlan.Reason, "use --force to update other ref") {
+		t.Errorf("expected clear --force-required reason for other-kind ref, got %q", notesPlan.Reason)
+	}
+
+	// Same scenario with --force succeeds.
+	cfg.Force = true
+	if _, err := Run(context.Background(), cfg); err != nil {
+		t.Fatalf("force-update of other-kind ref failed: %v", err)
+	}
+	gotNotes, err := targetRepo.Reference(notesRef, true)
+	if err != nil {
+		t.Fatalf("expected refs/notes/commits on target: %v", err)
+	}
+	if gotNotes.Hash() != newHead.Hash() {
+		t.Fatalf("target notes hash = %s, want %s", gotNotes.Hash(), newHead.Hash())
+	}
+}
+
 // Pure-prune replicate runs (no source-side updates) must actually delete
 // the orphaned ref. The runReplicate gate previously required at least one
 // relay plan, so delete-only scenarios silently no-op'd; this pins the
@@ -3148,18 +3227,21 @@ func TestRun_IntegrationReplicateAllRefsPruneSkipsBootstrapForStaleOtherRef(t *t
 	}
 }
 
-// Pins a v1 limitation: replicate is relay-only, so other-kind refs into a
-// non-empty target error out (sync handles it via materialized fallback).
-func TestRun_IntegrationAllRefsReplicateRejectsOtherKindIntoExistingTarget(t *testing.T) {
+// Replicate's relay covers other-kind refs (notes, pulls, custom namespaces)
+// just like branches and tags — the overwrite semantics make the
+// fast-forward concern that keeps them out of incremental sync relay
+// irrelevant here. This pins idempotent re-runs: replicate --all-refs
+// must keep working when a notes ref updates between runs.
+func TestRun_IntegrationAllRefsReplicateUpdatesOtherKindOnSecondRun(t *testing.T) {
 	sourceRepo, sourceFS := newSourceRepo(t)
 	makeCommits(t, sourceRepo, sourceFS, 2)
 
-	head, err := sourceRepo.Reference(plumbing.NewBranchReferenceName(testBranch), true)
+	firstHead, err := sourceRepo.Reference(plumbing.NewBranchReferenceName(testBranch), true)
 	if err != nil {
-		t.Fatalf("resolve source head: %v", err)
+		t.Fatalf("resolve first source head: %v", err)
 	}
 	notesRef := plumbing.ReferenceName("refs/notes/commits")
-	if err := sourceRepo.Storer.SetReference(plumbing.NewHashReference(notesRef, head.Hash())); err != nil {
+	if err := sourceRepo.Storer.SetReference(plumbing.NewHashReference(notesRef, firstHead.Hash())); err != nil {
 		t.Fatalf("set source notes ref: %v", err)
 	}
 
@@ -3167,27 +3249,46 @@ func TestRun_IntegrationAllRefsReplicateRejectsOtherKindIntoExistingTarget(t *te
 	if err != nil {
 		t.Fatalf("init target repo: %v", err)
 	}
-	if err := copyRefsAndObjects(sourceRepo.Storer, targetRepo.Storer, []plumbing.ReferenceName{plumbing.NewBranchReferenceName(testBranch)}); err != nil {
-		t.Fatalf("copy target baseline: %v", err)
-	}
 
 	sourceServer := newSmartHTTPRepoServerV2(t, sourceRepo)
 	targetServer := newSmartHTTPRepoServer(t, targetRepo)
 	defer sourceServer.Close()
 	defer targetServer.Close()
 
-	_, err = Run(context.Background(), Config{
+	cfg := Config{
 		Source:       Endpoint{URL: sourceServer.RepoURL()},
 		Target:       Endpoint{URL: targetServer.RepoURL()},
 		ProtocolMode: protocolModeAuto,
 		Mode:         modeReplicate,
 		AllRefs:      true,
-	})
-	if err == nil {
-		t.Fatal("expected replicate to reject other-kind refs in non-empty target")
 	}
-	if !strings.Contains(err.Error(), "use sync instead") {
-		t.Fatalf("expected error to direct user to sync, got %v", err)
+	if _, err := Run(context.Background(), cfg); err != nil {
+		t.Fatalf("first replicate --all-refs failed: %v", err)
+	}
+
+	// Move the notes ref forward on the source and run replicate again —
+	// this used to fail with "replicate-unsupported-ref-kind".
+	makeCommits(t, sourceRepo, sourceFS, 1)
+	updatedHead, err := sourceRepo.Reference(plumbing.NewBranchReferenceName(testBranch), true)
+	if err != nil {
+		t.Fatalf("resolve updated source head: %v", err)
+	}
+	if err := sourceRepo.Storer.SetReference(plumbing.NewHashReference(notesRef, updatedHead.Hash())); err != nil {
+		t.Fatalf("update source notes ref: %v", err)
+	}
+	result, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("second replicate --all-refs failed: %v", err)
+	}
+	if !result.Relay {
+		t.Errorf("expected relay path on second replicate, got Relay=false RelayMode=%q", result.RelayMode)
+	}
+	gotNotes, err := targetRepo.Reference(notesRef, true)
+	if err != nil {
+		t.Fatalf("expected refs/notes/commits on target: %v", err)
+	}
+	if gotNotes.Hash() != updatedHead.Hash() {
+		t.Fatalf("target notes hash = %s, want %s", gotNotes.Hash(), updatedHead.Hash())
 	}
 }
 

@@ -183,6 +183,12 @@ rejected refs to warnings would let partial mirrors exit successfully,
 which contradicts the command. Use `sync --all-refs` if you want
 best-effort completeness against hostile targets.
 
+`sync --all-refs` blocks updates to non-branch refs (notes, pulls, custom
+namespaces) by default — those refs don't generally form fast-forward
+chains, so the same `--force` opt-in that retargets tags is required to
+update them. `replicate` doesn't run that check; its overwrite contract
+covers other-kind refs without `--force`.
+
 `SyncPolicy.BestEffort` is independent of scope and can be set without
 `AllRefs` if a library caller wants per-ref warn semantics on a narrower
 scope.
