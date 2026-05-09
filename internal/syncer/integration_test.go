@@ -2963,6 +2963,156 @@ func TestRun_IntegrationAllRefsBestEffortDowngradesNgToWarn(t *testing.T) {
 	}
 }
 
+// TestRun_IntegrationAllRefsIncrementalRelayWithBranchOnlyPush verifies
+// that setting AllRefs does not regress the incremental relay path when
+// the actual push plan happens to be branch-only (e.g. source has a
+// notes ref but it's already current on target). The broader ref
+// discovery should still let CanIncrementalRelay accept a branch-only
+// pushPlans slice and take the relay fast path.
+func TestRun_IntegrationAllRefsIncrementalRelayWithBranchOnlyPush(t *testing.T) {
+	sourceRepo, sourceFS := newSourceRepo(t)
+	makeCommits(t, sourceRepo, sourceFS, 2)
+
+	notesRef := plumbing.ReferenceName("refs/notes/commits")
+	preNotesHead, err := sourceRepo.Reference(plumbing.NewBranchReferenceName(testBranch), true)
+	if err != nil {
+		t.Fatalf("resolve pre-update head: %v", err)
+	}
+	if err := sourceRepo.Storer.SetReference(plumbing.NewHashReference(notesRef, preNotesHead.Hash())); err != nil {
+		t.Fatalf("set source notes ref: %v", err)
+	}
+
+	targetRepo, err := git.Init(memory.NewStorage())
+	if err != nil {
+		t.Fatalf("init target repo: %v", err)
+	}
+	// Pre-populate target with both the branch and the notes ref so they
+	// match source. The incoming sync only needs to push branch updates.
+	if err := copyRefsAndObjects(sourceRepo.Storer, targetRepo.Storer, []plumbing.ReferenceName{plumbing.NewBranchReferenceName(testBranch), notesRef}); err != nil {
+		t.Fatalf("copy target baseline: %v", err)
+	}
+	makeCommits(t, sourceRepo, sourceFS, 1)
+
+	sourceServer := newSmartHTTPRepoServerV2(t, sourceRepo)
+	targetServer := newSmartHTTPRepoServer(t, targetRepo)
+	targetServer.receivePackThinCap = true
+	defer sourceServer.Close()
+	defer targetServer.Close()
+
+	result, err := Run(context.Background(), Config{
+		Source:       Endpoint{URL: sourceServer.RepoURL()},
+		Target:       Endpoint{URL: targetServer.RepoURL()},
+		ProtocolMode: protocolModeAuto,
+		AllRefs:      true,
+	})
+	if err != nil {
+		t.Fatalf("all-refs branch-only sync failed: %v", err)
+	}
+	if !result.Relay || result.RelayMode != relayModeIncremental {
+		t.Fatalf("expected incremental relay despite AllRefs scope, got mode=%q reason=%q relay=%v", result.RelayMode, result.RelayReason, result.Relay)
+	}
+	if result.Pushed != 1 {
+		t.Fatalf("expected Pushed=1 (branch update), got %d (result: %+v)", result.Pushed, result)
+	}
+	assertHeadsMatch(t, sourceRepo, targetRepo, testBranch)
+}
+
+// TestBootstrap_IntegrationAllRefsBatchedTailPhase verifies the batched
+// bootstrap path (target-max-pack-bytes set) routes other-kind refs
+// through the create-only tail phase alongside tags, exercising the
+// rename from tag-phase to tail-phase that this branch introduced.
+func TestBootstrap_IntegrationAllRefsBatchedTailPhase(t *testing.T) {
+	sourceRepo, sourceFS := newSourceRepo(t)
+	makeLargeCommits(t, sourceRepo, sourceFS, 5, 200_000)
+
+	head, err := sourceRepo.Reference(plumbing.NewBranchReferenceName(testBranch), true)
+	if err != nil {
+		t.Fatalf("resolve source head: %v", err)
+	}
+	notesRef := plumbing.ReferenceName("refs/notes/commits")
+	if err := sourceRepo.Storer.SetReference(plumbing.NewHashReference(notesRef, head.Hash())); err != nil {
+		t.Fatalf("set source notes ref: %v", err)
+	}
+
+	targetRepo, err := git.Init(memory.NewStorage())
+	if err != nil {
+		t.Fatalf("init target repo: %v", err)
+	}
+
+	sourceServer := newSmartHTTPRepoServerV2(t, sourceRepo)
+	targetServer := newSmartHTTPRepoServer(t, targetRepo)
+	defer sourceServer.Close()
+	defer targetServer.Close()
+
+	result, err := Bootstrap(context.Background(), Config{
+		Source:             Endpoint{URL: sourceServer.RepoURL()},
+		Target:             Endpoint{URL: targetServer.RepoURL()},
+		ProtocolMode:       protocolModeAuto,
+		AllRefs:            true,
+		TargetMaxPackBytes: 350_000,
+	})
+	if err != nil {
+		t.Fatalf("batched all-refs bootstrap failed: %v", err)
+	}
+	if !result.Batching {
+		t.Fatalf("expected batched bootstrap, got %+v", result)
+	}
+	gotNotes, err := targetRepo.Reference(notesRef, true)
+	if err != nil {
+		t.Fatalf("expected refs/notes/commits on target after batched bootstrap: %v", err)
+	}
+	if gotNotes.Hash() != head.Hash() {
+		t.Fatalf("target notes hash = %s, want %s", gotNotes.Hash(), head.Hash())
+	}
+	assertHeadsMatch(t, sourceRepo, targetRepo, testBranch)
+}
+
+// TestRun_IntegrationAllRefsReplicateRejectsOtherKindIntoExistingTarget
+// pins the current limitation: replicate's relay-only push path requires
+// branch or tag refs, so AllRefs other-kind refs cannot replicate into a
+// non-empty target. Sync supports this via materialized fallback;
+// replicate fails fast with a clear error directing the user to sync.
+func TestRun_IntegrationAllRefsReplicateRejectsOtherKindIntoExistingTarget(t *testing.T) {
+	sourceRepo, sourceFS := newSourceRepo(t)
+	makeCommits(t, sourceRepo, sourceFS, 2)
+
+	head, err := sourceRepo.Reference(plumbing.NewBranchReferenceName(testBranch), true)
+	if err != nil {
+		t.Fatalf("resolve source head: %v", err)
+	}
+	notesRef := plumbing.ReferenceName("refs/notes/commits")
+	if err := sourceRepo.Storer.SetReference(plumbing.NewHashReference(notesRef, head.Hash())); err != nil {
+		t.Fatalf("set source notes ref: %v", err)
+	}
+
+	targetRepo, err := git.Init(memory.NewStorage())
+	if err != nil {
+		t.Fatalf("init target repo: %v", err)
+	}
+	if err := copyRefsAndObjects(sourceRepo.Storer, targetRepo.Storer, []plumbing.ReferenceName{plumbing.NewBranchReferenceName(testBranch)}); err != nil {
+		t.Fatalf("copy target baseline: %v", err)
+	}
+
+	sourceServer := newSmartHTTPRepoServerV2(t, sourceRepo)
+	targetServer := newSmartHTTPRepoServer(t, targetRepo)
+	defer sourceServer.Close()
+	defer targetServer.Close()
+
+	_, err = Run(context.Background(), Config{
+		Source:       Endpoint{URL: sourceServer.RepoURL()},
+		Target:       Endpoint{URL: targetServer.RepoURL()},
+		ProtocolMode: protocolModeAuto,
+		Mode:         modeReplicate,
+		AllRefs:      true,
+	})
+	if err == nil {
+		t.Fatal("expected replicate to reject other-kind refs in non-empty target")
+	}
+	if !strings.Contains(err.Error(), "use sync instead") {
+		t.Fatalf("expected error to direct user to sync, got %v", err)
+	}
+}
+
 // TestRun_IntegrationAllRefsRejectsCustomMappingWithoutAllRefs locks in the
 // validation gate: mapping a non-branch/non-tag ref errors when AllRefs is
 // not set, so the strict default flow stays loud about unsupported refs.
