@@ -841,10 +841,12 @@ func (s *syncSession) runReplicate(ctx context.Context) (Result, error) {
 		}
 	}
 
-	if !s.cfg.DryRun && len(relayPlans) > 0 {
-		ok, reason := planner.CanReplicateRelay(relayPlans)
-		if !ok {
-			return result, fmt.Errorf("replicate requires relay-capable target: %s; use sync instead", reason)
+	if !s.cfg.DryRun && len(pushPlans) > 0 {
+		if len(relayPlans) > 0 {
+			ok, reason := planner.CanReplicateRelay(relayPlans)
+			if !ok {
+				return result, fmt.Errorf("replicate requires relay-capable target: %s; use sync instead", reason)
+			}
 		}
 		repResult, err := s.executeReplicate(ctx, desiredRefs, pushPlans)
 		if err != nil {
@@ -881,6 +883,8 @@ func (s *syncSession) replicateCanBootstrap(desiredRefs map[plumbing.ReferenceNa
 		case targetRef.IsTag() && s.cfg.IncludeTags:
 			return false
 		case targetRef.IsBranch() && len(s.cfg.Mappings) == 0 && len(s.cfg.Branches) == 0:
+			return false
+		case s.cfg.AllRefs && planner.RefKindFromName(targetRef) == planner.RefKindOther && len(s.cfg.Mappings) == 0:
 			return false
 		}
 	}

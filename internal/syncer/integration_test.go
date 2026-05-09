@@ -3050,6 +3050,56 @@ func TestBootstrap_IntegrationAllRefsBatchedTailPhase(t *testing.T) {
 	assertHeadsMatch(t, sourceRepo, targetRepo, testBranch)
 }
 
+// Replicate's bootstrap shortcut must not fire when --prune --all-refs has
+// stale other-kind refs to delete on target; otherwise replicate would
+// claim "target matches source" while leaving orphaned refs/notes/* behind.
+func TestRun_IntegrationReplicateAllRefsPruneSkipsBootstrapForStaleOtherRef(t *testing.T) {
+	sourceRepo, sourceFS := newSourceRepo(t)
+	makeCommits(t, sourceRepo, sourceFS, 1)
+
+	targetRepo, err := git.Init(memory.NewStorage())
+	if err != nil {
+		t.Fatalf("init target repo: %v", err)
+	}
+	// Target has an orphaned notes ref that doesn't exist on source.
+	staleHead, err := sourceRepo.Reference(plumbing.NewBranchReferenceName(testBranch), true)
+	if err != nil {
+		t.Fatalf("resolve source head: %v", err)
+	}
+	if err := copyRefsAndObjects(sourceRepo.Storer, targetRepo.Storer, []plumbing.ReferenceName{plumbing.NewBranchReferenceName(testBranch)}); err != nil {
+		t.Fatalf("copy target baseline: %v", err)
+	}
+	staleNotes := plumbing.ReferenceName("refs/notes/stale")
+	if err := targetRepo.Storer.SetReference(plumbing.NewHashReference(staleNotes, staleHead.Hash())); err != nil {
+		t.Fatalf("set stale notes ref on target: %v", err)
+	}
+
+	sourceServer := newSmartHTTPRepoServerV2(t, sourceRepo)
+	targetServer := newSmartHTTPRepoServer(t, targetRepo)
+	defer sourceServer.Close()
+	defer targetServer.Close()
+
+	result, err := Run(context.Background(), Config{
+		Source:       Endpoint{URL: sourceServer.RepoURL()},
+		Target:       Endpoint{URL: targetServer.RepoURL()},
+		ProtocolMode: protocolModeAuto,
+		Mode:         modeReplicate,
+		AllRefs:      true,
+		Prune:        true,
+	})
+	if err != nil {
+		t.Fatalf("replicate --all-refs --prune failed: %v", err)
+	}
+	if result.RelayMode == "bootstrap" {
+		t.Fatalf("expected replicate to take prune path, not bootstrap; got RelayMode=%q", result.RelayMode)
+	}
+	if _, err := targetRepo.Reference(staleNotes, true); err == nil {
+		t.Fatalf("expected stale %s to be pruned from target", staleNotes)
+	} else if !errors.Is(err, plumbing.ErrReferenceNotFound) {
+		t.Fatalf("unexpected error resolving stale ref: %v", err)
+	}
+}
+
 // Pins a v1 limitation: replicate is relay-only, so other-kind refs into a
 // non-empty target error out (sync handles it via materialized fallback).
 func TestRun_IntegrationAllRefsReplicateRejectsOtherKindIntoExistingTarget(t *testing.T) {

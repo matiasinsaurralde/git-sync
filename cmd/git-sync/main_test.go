@@ -20,8 +20,10 @@ import (
 	git "github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v6/plumbing/format/pktline"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp/capability"
+	"github.com/go-git/go-git/v6/plumbing/protocol/packp/sideband"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage/memory"
 )
@@ -330,6 +332,97 @@ func TestRun_Sync_AllRefsSmokeTest(t *testing.T) {
 	}
 }
 
+// replicate must keep strict failure semantics — its contract is "target
+// matches source" — so --all-refs must NOT bundle BestEffort the way it does
+// for sync. A target ng on any ref must surface as a non-nil error.
+func TestRun_Replicate_AllRefsKeepsStrictFailureOnNg(t *testing.T) {
+	sourceRepo, sourceFS := newSourceRepo(t)
+	makeCommits(t, sourceRepo, sourceFS, 1)
+
+	targetRepo, err := git.Init(memory.NewStorage())
+	if err != nil {
+		t.Fatalf("init target repo: %v", err)
+	}
+
+	sourceServer := newSmartHTTPRepoServer(t, sourceRepo)
+	targetServer := newSmartHTTPRepoServer(t, targetRepo)
+	defer sourceServer.Close()
+	defer targetServer.Close()
+
+	targetServer.receivePackHook = func(req *packp.UpdateRequests) *packp.ReportStatus {
+		report := packp.NewReportStatus()
+		report.UnpackStatus = "ok"
+		for _, cmd := range req.Commands {
+			report.CommandStatuses = append(report.CommandStatuses, &packp.CommandStatus{
+				ReferenceName: cmd.Name,
+				Status:        "deny updating a hidden ref",
+			})
+		}
+		return report
+	}
+
+	err = run(context.Background(), []string{
+		modeReplicate,
+		"--all-refs",
+		"--json",
+		sourceServer.RepoURL(),
+		targetServer.RepoURL(),
+	})
+	if err == nil {
+		t.Fatal("expected replicate --all-refs to error on per-ref ng")
+	}
+}
+
+// Mirror of the above for sync: the same target rejection must turn into a
+// warning and a successful exit, so the CLI binding really differs by mode.
+func TestRun_Sync_AllRefsWarnsOnNg(t *testing.T) {
+	sourceRepo, sourceFS := newSourceRepo(t)
+	makeCommits(t, sourceRepo, sourceFS, 1)
+
+	targetRepo, err := git.Init(memory.NewStorage())
+	if err != nil {
+		t.Fatalf("init target repo: %v", err)
+	}
+
+	sourceServer := newSmartHTTPRepoServer(t, sourceRepo)
+	targetServer := newSmartHTTPRepoServer(t, targetRepo)
+	defer sourceServer.Close()
+	defer targetServer.Close()
+
+	targetServer.receivePackHook = func(req *packp.UpdateRequests) *packp.ReportStatus {
+		report := packp.NewReportStatus()
+		report.UnpackStatus = "ok"
+		for _, cmd := range req.Commands {
+			report.CommandStatuses = append(report.CommandStatuses, &packp.CommandStatus{
+				ReferenceName: cmd.Name,
+				Status:        "deny updating a hidden ref",
+			})
+		}
+		return report
+	}
+
+	output, err := captureStdout(func() error {
+		return run(context.Background(), []string{
+			"sync",
+			"--all-refs",
+			"--json",
+			sourceServer.RepoURL(),
+			targetServer.RepoURL(),
+		})
+	})
+	if err != nil {
+		t.Fatalf("expected sync --all-refs to succeed with warning, got: %v\noutput=%s", err, output)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("decode sync json: %v\noutput=%s", err, output)
+	}
+	if got, _ := result["warned"].(float64); got == 0 {
+		t.Fatalf("expected warned > 0 in result, got %#v", result["warned"])
+	}
+}
+
 func TestRun_Replicate_SubcommandRejectsForce(t *testing.T) {
 	err := run(context.Background(), []string{
 		modeReplicate,
@@ -469,6 +562,11 @@ type smartHTTPRepoServer struct {
 	repo     *git.Repository
 	repoPath string
 
+	// receivePackHook synthesizes the receive-pack response when set,
+	// bypassing the embedded ReceivePack handler. Used to simulate
+	// per-ref ng statuses from hostile targets.
+	receivePackHook func(*packp.UpdateRequests) *packp.ReportStatus
+
 	mu           sync.Mutex
 	receivePacks int
 	thinCapable  bool
@@ -599,6 +697,46 @@ func (s *smartHTTPRepoServer) handleReceivePack(w http.ResponseWriter, r *http.R
 	s.mu.Lock()
 	s.receivePacks++
 	s.mu.Unlock()
+
+	if s.receivePackHook != nil {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		req := packp.NewUpdateRequests()
+		if err := req.Decode(bytes.NewReader(body)); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		report := s.receivePackHook(req)
+		// Wrap the report in sideband framing when negotiated, mirroring
+		// what transport.ReceivePack writes; the client's demuxer otherwise
+		// fails on raw report-status pkt-lines.
+		var buf bytes.Buffer
+		var writer io.Writer = &buf
+		useSideband := false
+		switch {
+		case req.Capabilities.Supports(capability.Sideband64k):
+			writer = sideband.NewMuxer(sideband.Sideband64k, &buf)
+			useSideband = true
+		case req.Capabilities.Supports(capability.Sideband):
+			writer = sideband.NewMuxer(sideband.Sideband, &buf)
+			useSideband = true
+		}
+		if err := report.Encode(nopWriteCloser{writer}); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if useSideband {
+			_ = pktline.WriteFlush(&buf)
+		}
+		w.Header().Set("Content-Type", "application/x-git-receive-pack-result")
+		if _, err := w.Write(buf.Bytes()); err != nil {
+			s.t.Fatalf("write receive-pack hook response: %v", err)
+		}
+		return
+	}
 
 	var buf bytes.Buffer
 	wc := nopWriteCloser{&buf}

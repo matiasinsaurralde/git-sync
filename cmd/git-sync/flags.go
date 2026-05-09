@@ -46,20 +46,28 @@ func addProtocolFlag(cmd *cobra.Command, mode *protocolModeFlag) {
 	cmd.Flags().Var(mode, "protocol", "protocol mode: auto, v1, or v2")
 }
 
-// allRefsFlag registers --all-refs. The CLI semantic bundles AllRefs scope
-// with best-effort failure handling: pass bestEffort to have it set whenever
-// --all-refs is, via a PreRunE hook that fires after flag parsing.
-func allRefsFlag(cmd *cobra.Command, allRefs, bestEffort *bool) {
-	cmd.Flags().BoolVar(allRefs, "all-refs", false,
-		"mirror every refs/* on the source (notes, pulls, custom namespaces) on a best-effort basis; "+
-			"per-ref server rejections become warnings rather than failing the sync")
-	if bestEffort == nil {
+const (
+	allRefsUsageBestEffort = "mirror every refs/* on the source (branches, tags, notes, pulls, custom namespaces) on a best-effort basis; per-ref server rejections become warnings rather than failing the sync"
+	allRefsUsageStrict     = "mirror every refs/* on the source (branches, tags, notes, pulls, custom namespaces); per-ref rejections fail the run, since replicate's contract is target == source"
+	allRefsUsageScopeOnly  = "include every refs/* on the source (notes, pulls, custom namespaces) — scope only, no failure-handling effect"
+)
+
+// allRefsFlag registers --all-refs with the supplied usage string and
+// bundles its implications. Each pointer in implies is set to true when
+// --all-refs is set, via a PreRunE hook that fires after flag parsing.
+func allRefsFlag(cmd *cobra.Command, usage string, allRefs *bool, implies ...*bool) {
+	cmd.Flags().BoolVar(allRefs, "all-refs", false, usage)
+	if len(implies) == 0 {
 		return
 	}
 	prev := cmd.PreRunE
 	cmd.PreRunE = func(cmd *cobra.Command, args []string) error {
 		if *allRefs {
-			*bestEffort = true
+			for _, p := range implies {
+				if p != nil {
+					*p = true
+				}
+			}
 		}
 		if prev != nil {
 			return prev(cmd, args)

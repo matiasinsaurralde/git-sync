@@ -166,16 +166,23 @@ git-sync sync \
 
 `--all-refs` broadens the source ref discovery from `refs/heads/`+`refs/tags/`
 to every `refs/*` namespace and lets ref mappings target arbitrary
-namespaces (`refs/notes/*`, `refs/pull/*`, custom refs). It also turns on
-best-effort failure handling: when the target's `receive-pack` rejects an
-individual ref (e.g. GitHub refusing writes to `refs/pull/*` hidden refs),
-the rejected ref appears in the result with `action=warn` and the server's
-reason instead of failing the whole sync. Pack-level transport or unpack
-failures remain fatal.
+namespaces (`refs/notes/*`, `refs/pull/*`, custom refs). For `sync` and
+`bootstrap` the flag also implies `--tags` (so the broader scope really is
+"every refs/*") and turns on best-effort failure handling: when the
+target's `receive-pack` rejects an individual ref (e.g. GitHub refusing
+writes to `refs/pull/*` hidden refs), the rejected ref appears in the
+result with `action=warn` and the server's reason instead of failing the
+whole sync. Pack-level transport or unpack failures remain fatal.
 
-Library callers can decouple the two halves: `RefScope.AllRefs` controls
-scope alone, and `SyncPolicy.BestEffort` controls failure handling. The
-CLI bundles them under `--all-refs` for convenience.
+`replicate --all-refs` broadens the same scope but does NOT enable
+best-effort. Replicate's contract is "target refs match source"; downgrading
+rejected refs to warnings would let partial mirrors exit successfully,
+which contradicts the command. Use `sync --all-refs` if you want
+best-effort completeness against hostile targets.
+
+Library callers can decouple the halves: `RefScope.AllRefs`,
+`SyncPolicy.IncludeTags`, and `SyncPolicy.BestEffort` are independent.
+The CLI bundles them under `--all-refs` for convenience.
 
 Force source-side protocol v2:
 
