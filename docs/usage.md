@@ -165,14 +165,17 @@ git-sync sync \
 ```
 
 `--all-refs` broadens the source ref discovery from `refs/heads/`+`refs/tags/`
-to every `refs/*` namespace and lets ref mappings target arbitrary
-namespaces (`refs/notes/*`, `refs/pull/*`, custom refs). For `sync` and
-`bootstrap` the flag also implies `--tags` (so the broader scope really is
-"every refs/*") and turns on best-effort failure handling: when the
-target's `receive-pack` rejects an individual ref (e.g. GitHub refusing
-writes to `refs/pull/*` hidden refs), the rejected ref appears in the
-result with `action=warn` and the server's reason instead of failing the
-whole sync. Pack-level transport or unpack failures remain fatal.
+to every `refs/*` namespace (branches, tags, `refs/notes/*`, `refs/pull/*`,
+custom refs) and lets ref mappings target arbitrary namespaces. Tag
+inclusion is implied — `RefScope.AllRefs` covers tags at the library level,
+so `--tags` does not need to be combined with `--all-refs`.
+
+For `sync` and `bootstrap` the flag also turns on best-effort failure
+handling: when the target's `receive-pack` rejects an individual ref (e.g.
+GitHub refusing writes to `refs/pull/*` hidden refs), the rejected ref
+appears in the result with `action=warn` and the server's reason instead
+of failing the whole sync. Pack-level transport or unpack failures remain
+fatal.
 
 `replicate --all-refs` broadens the same scope but does NOT enable
 best-effort. Replicate's contract is "target refs match source"; downgrading
@@ -180,9 +183,9 @@ rejected refs to warnings would let partial mirrors exit successfully,
 which contradicts the command. Use `sync --all-refs` if you want
 best-effort completeness against hostile targets.
 
-Library callers can decouple the halves: `RefScope.AllRefs`,
-`SyncPolicy.IncludeTags`, and `SyncPolicy.BestEffort` are independent.
-The CLI bundles them under `--all-refs` for convenience.
+`SyncPolicy.BestEffort` is independent of scope and can be set without
+`AllRefs` if a library caller wants per-ref warn semantics on a narrower
+scope.
 
 Force source-side protocol v2:
 

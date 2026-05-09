@@ -880,7 +880,7 @@ func (s *syncSession) replicateCanBootstrap(desiredRefs map[plumbing.ReferenceNa
 			continue
 		}
 		switch {
-		case targetRef.IsTag() && s.cfg.IncludeTags:
+		case targetRef.IsTag() && (s.cfg.IncludeTags || s.cfg.AllRefs):
 			return false
 		case targetRef.IsBranch() && len(s.cfg.Mappings) == 0 && len(s.cfg.Branches) == 0:
 			return false

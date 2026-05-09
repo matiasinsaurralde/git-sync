@@ -390,23 +390,22 @@ func TestBuildDesiredRefsAllRefs(t *testing.T) {
 		plumbing.ReferenceName("refs/pull/1/head"):   hashPull,
 	}
 
-	t.Run("AllRefs adds non-branch non-tag refs", func(t *testing.T) {
+	t.Run("AllRefs covers branches, tags, and other-kind refs", func(t *testing.T) {
 		desired, _, err := BuildDesiredRefs(sourceRefs, PlanConfig{AllRefs: true})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		// Branches still come in; tags need IncludeTags; "other" comes from AllRefs.
-		if _, ok := desired[plumbing.ReferenceName("refs/notes/commits")]; !ok {
-			t.Error("expected refs/notes/commits in desired set")
+		// AllRefs implies tag inclusion: the contract is "every refs/*".
+		want := []plumbing.ReferenceName{
+			plumbing.NewBranchReferenceName("main"),
+			plumbing.NewTagReferenceName("v1.0"),
+			plumbing.ReferenceName("refs/notes/commits"),
+			plumbing.ReferenceName("refs/pull/1/head"),
 		}
-		if _, ok := desired[plumbing.ReferenceName("refs/pull/1/head")]; !ok {
-			t.Error("expected refs/pull/1/head in desired set")
-		}
-		if _, ok := desired[plumbing.NewTagReferenceName("v1.0")]; ok {
-			t.Error("tag should not appear without IncludeTags")
-		}
-		if _, ok := desired[plumbing.NewBranchReferenceName("main")]; !ok {
-			t.Error("branch should still appear with default selection")
+		for _, ref := range want {
+			if _, ok := desired[ref]; !ok {
+				t.Errorf("expected %s in desired set", ref)
+			}
 		}
 	})
 

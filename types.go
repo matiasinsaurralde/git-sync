@@ -79,7 +79,8 @@ type RefMapping struct {
 }
 
 // RefScope constrains which refs a request manages. AllRefs broadens scope
-// to every refs/* on the source (notes, pulls, custom namespaces).
+// to every refs/* on the source (branches, tags, notes, pulls, custom
+// namespaces) and implies SyncPolicy.IncludeTags.
 type RefScope struct {
 	Branches []string     `json:"branches"`
 	Mappings []RefMapping `json:"mappings"`

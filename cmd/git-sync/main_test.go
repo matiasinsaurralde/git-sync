@@ -332,6 +332,65 @@ func TestRun_Sync_AllRefsSmokeTest(t *testing.T) {
 	}
 }
 
+// fetch --all-refs must broaden discovery to tags and other-kind refs
+// without needing --tags, matching the AllRefs contract at the library level.
+func TestRun_Fetch_AllRefsCoversTagsAndOtherKind(t *testing.T) {
+	sourceRepo, sourceFS := newSourceRepo(t)
+	makeCommits(t, sourceRepo, sourceFS, 1)
+
+	head, err := sourceRepo.Reference(plumbing.NewBranchReferenceName(testBranch), true)
+	if err != nil {
+		t.Fatalf("resolve source head: %v", err)
+	}
+	tagRef := plumbing.NewTagReferenceName("v1")
+	if err := sourceRepo.Storer.SetReference(plumbing.NewHashReference(tagRef, head.Hash())); err != nil {
+		t.Fatalf("set source tag: %v", err)
+	}
+	notesRef := plumbing.ReferenceName("refs/notes/commits")
+	if err := sourceRepo.Storer.SetReference(plumbing.NewHashReference(notesRef, head.Hash())); err != nil {
+		t.Fatalf("set source notes ref: %v", err)
+	}
+
+	sourceServer := newSmartHTTPRepoServer(t, sourceRepo)
+	defer sourceServer.Close()
+
+	output, err := captureStdout(func() error {
+		return run(context.Background(), []string{
+			"fetch",
+			"--all-refs",
+			"--json",
+			sourceServer.RepoURL(),
+		})
+	})
+	if err != nil {
+		t.Fatalf("run fetch --all-refs: %v\noutput=%s", err, output)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatalf("decode fetch json: %v\noutput=%s", err, output)
+	}
+	wants, ok := result["wants"].([]any)
+	if !ok {
+		t.Fatalf("expected wants in result, got %#v", result)
+	}
+	seen := make(map[string]bool)
+	for _, raw := range wants {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if name, _ := entry["name"].(string); name != "" {
+			seen[name] = true
+		}
+	}
+	for _, want := range []string{string(tagRef), string(notesRef)} {
+		if !seen[want] {
+			t.Errorf("expected %s in fetch wants, got %v", want, seen)
+		}
+	}
+}
+
 // replicate must keep strict failure semantics — its contract is "target
 // matches source" — so --all-refs must NOT bundle BestEffort the way it does
 // for sync. A target ng on any ref must surface as a non-nil error.

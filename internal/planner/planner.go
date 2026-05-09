@@ -79,7 +79,9 @@ func BuildDesiredRefs(
 		}
 	}
 
-	if cfg.IncludeTags {
+	// AllRefs implies tag inclusion: the contract is "every refs/* on the
+	// source," so tags are part of the broadened scope by definition.
+	if cfg.IncludeTags || cfg.AllRefs {
 		for refName, hash := range sourceRefs {
 			if !refName.IsTag() {
 				continue
@@ -232,7 +234,7 @@ func addPruneCandidates(managed map[plumbing.ReferenceName]ManagedTarget, target
 			continue
 		}
 		switch {
-		case targetRef.IsTag() && cfg.IncludeTags:
+		case targetRef.IsTag() && (cfg.IncludeTags || cfg.AllRefs):
 			managed[targetRef] = ManagedTarget{Kind: RefKindTag, Label: targetRef.Short()}
 		case targetRef.IsBranch() && len(cfg.Mappings) == 0 && len(cfg.Branches) == 0:
 			managed[targetRef] = ManagedTarget{Kind: RefKindBranch, Label: targetRef.Short()}

@@ -111,9 +111,11 @@ func newSyncLikeCmd(name, short string, dryRun bool, defaultMode gitsync.Operati
 	cmd.Flags().BoolVar(&req.Policy.IncludeTags, "tags", false, "mirror tags")
 	cmd.Flags().BoolVar(&req.Policy.Force, "force", false, "allow non-fast-forward branch updates and retarget tags")
 	cmd.Flags().BoolVar(&req.Policy.Prune, "prune", false, "delete managed target refs that no longer exist on source")
-	// Replicate keeps strict failure semantics — its contract is "target
-	// refs match source." BestEffort would let partial mirrors exit success.
-	implies := []*bool{&req.Policy.IncludeTags}
+	// Tag inclusion is now handled at the library level (AllRefs implies
+	// it in BuildDesiredRefs). Replicate keeps strict failure semantics —
+	// its contract is "target refs match source," so BestEffort is not
+	// bundled there; sync/plan get it for the best-effort UX.
+	var implies []*bool
 	usage := allRefsUsageBestEffort
 	if defaultMode == gitsync.ModeReplicate {
 		usage = allRefsUsageStrict
