@@ -22,6 +22,67 @@ import (
 	"entire.io/entire/git-sync/internal/planner"
 )
 
+func TestHoistSourceHeadCommand(t *testing.T) {
+	main := plumbing.NewBranchReferenceName("main")
+	master := plumbing.NewBranchReferenceName("master")
+	alpha := plumbing.NewBranchReferenceName("alpha")
+
+	cmd := func(name plumbing.ReferenceName) gitproto.PushCommand {
+		return gitproto.PushCommand{Name: name}
+	}
+
+	tests := []struct {
+		name   string
+		cmds   []gitproto.PushCommand
+		head   plumbing.ReferenceName
+		wanted []plumbing.ReferenceName
+	}{
+		{
+			name:   "hoists matching command to front",
+			cmds:   []gitproto.PushCommand{cmd(alpha), cmd(main), cmd(master)},
+			head:   main,
+			wanted: []plumbing.ReferenceName{main, alpha, master},
+		},
+		{
+			name:   "already first stays put",
+			cmds:   []gitproto.PushCommand{cmd(main), cmd(alpha)},
+			head:   main,
+			wanted: []plumbing.ReferenceName{main, alpha},
+		},
+		{
+			name:   "empty source HEAD is a no-op",
+			cmds:   []gitproto.PushCommand{cmd(alpha), cmd(main)},
+			head:   "",
+			wanted: []plumbing.ReferenceName{alpha, main},
+		},
+		{
+			name:   "no matching command is a no-op",
+			cmds:   []gitproto.PushCommand{cmd(alpha), cmd(master)},
+			head:   main,
+			wanted: []plumbing.ReferenceName{alpha, master},
+		},
+		{
+			name:   "single command",
+			cmds:   []gitproto.PushCommand{cmd(main)},
+			head:   main,
+			wanted: []plumbing.ReferenceName{main},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hoistSourceHeadCommand(tt.cmds, tt.head)
+			if len(got) != len(tt.wanted) {
+				t.Fatalf("length mismatch: got %d, want %d", len(got), len(tt.wanted))
+			}
+			for i, want := range tt.wanted {
+				if got[i].Name != want {
+					t.Errorf("position %d: got %q, want %q", i, got[i].Name, want)
+				}
+			}
+		})
+	}
+}
+
 func TestIsTargetBodyLimitError(t *testing.T) {
 	tests := []struct {
 		name string

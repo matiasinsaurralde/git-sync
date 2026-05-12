@@ -2811,6 +2811,53 @@ func TestRun_IntegrationSyncSurfacesSourceHEAD(t *testing.T) {
 	}
 }
 
+// Bootstrap pushes the source HEAD's branch as the first ref command, so
+// hosts that pick the default branch from the first push on a fresh repo
+// (GitHub, GitLab) end up with the right default. Source has an alpha
+// branch that sorts before master alphabetically; without the ordering
+// fix the bootstrap pushes alpha first and master second.
+func TestRun_IntegrationBootstrapPushesSourceHeadBranchFirst(t *testing.T) {
+	sourceRepo, sourceFS := newSourceRepo(t)
+	makeCommits(t, sourceRepo, sourceFS, 1)
+	head, err := sourceRepo.Reference(plumbing.NewBranchReferenceName(testBranch), true)
+	if err != nil {
+		t.Fatalf("resolve source head: %v", err)
+	}
+	if err := sourceRepo.Storer.SetReference(plumbing.NewHashReference(plumbing.NewBranchReferenceName("alpha"), head.Hash())); err != nil {
+		t.Fatalf("set alpha branch: %v", err)
+	}
+
+	targetRepo, err := git.Init(memory.NewStorage())
+	if err != nil {
+		t.Fatalf("init target repo: %v", err)
+	}
+
+	sourceServer := newSmartHTTPRepoServerV2(t, sourceRepo)
+	targetServer := newSmartHTTPRepoServer(t, targetRepo)
+	defer sourceServer.Close()
+	defer targetServer.Close()
+
+	var firstCommandRef plumbing.ReferenceName
+	targetServer.receivePackHook = func(req *packp.UpdateRequests, _ bool) *packp.ReportStatus {
+		if firstCommandRef == "" && len(req.Commands) > 0 {
+			firstCommandRef = req.Commands[0].Name
+		}
+		return nil // delegate to default handler
+	}
+
+	if _, err := Run(context.Background(), Config{
+		Source:       Endpoint{URL: sourceServer.RepoURL()},
+		Target:       Endpoint{URL: targetServer.RepoURL()},
+		ProtocolMode: protocolModeAuto,
+	}); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	want := plumbing.NewBranchReferenceName(testBranch)
+	if firstCommandRef != want {
+		t.Errorf("first receive-pack command = %q, want %q (source HEAD's branch should be pushed first)", firstCommandRef, want)
+	}
+}
+
 // Probe surfaces the source's symref HEAD target without performing a sync.
 func TestProbe_IntegrationSurfacesSourceHEAD(t *testing.T) {
 	sourceRepo, sourceFS := newSourceRepo(t)

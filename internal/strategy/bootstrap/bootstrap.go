@@ -177,6 +177,7 @@ func Execute(ctx context.Context, p Params, relayReason string) (Result, error) 
 		p.OnPhase("pushing pack")
 	}
 	cmds := convert.PlansToPushCommands(plans)
+	cmds = hoistSourceHeadCommand(cmds, p.SourceHeadTarget)
 	pushErr := p.TargetPusher.PushPack(ctx, cmds, packReader)
 	_ = packReader.Close()
 	if pushErr != nil {
@@ -194,6 +195,30 @@ func Execute(ctx context.Context, p Params, relayReason string) (Result, error) 
 
 	result.Pushed = len(plans)
 	return result, nil
+}
+
+// hoistSourceHeadCommand moves the push command whose ref matches the
+// source's symref HEAD target to the front of cmds. Hosts that pick the
+// default branch from the first push on a fresh repo (GitHub, GitLab) end
+// up with the right default. No-op when sourceHEAD is empty or not in cmds.
+func hoistSourceHeadCommand(cmds []gitproto.PushCommand, sourceHEAD plumbing.ReferenceName) []gitproto.PushCommand {
+	if sourceHEAD == "" || len(cmds) < 2 {
+		return cmds
+	}
+	for i, cmd := range cmds {
+		if cmd.Name != sourceHEAD {
+			continue
+		}
+		if i == 0 {
+			return cmds
+		}
+		out := make([]gitproto.PushCommand, 0, len(cmds))
+		out = append(out, cmd)
+		out = append(out, cmds[:i]...)
+		out = append(out, cmds[i+1:]...)
+		return out
+	}
+	return cmds
 }
 
 func adjustedBootstrapTargetRefs(
