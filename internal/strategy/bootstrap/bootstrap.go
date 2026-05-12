@@ -176,8 +176,7 @@ func Execute(ctx context.Context, p Params, relayReason string) (Result, error) 
 	if p.OnPhase != nil {
 		p.OnPhase("pushing pack")
 	}
-	cmds := convert.PlansToPushCommands(plans)
-	cmds = hoistSourceHeadCommand(cmds, p.SourceHeadTarget)
+	cmds := convert.PlansToPushCommands(hoistSourceHeadPlan(plans, p.SourceHeadTarget))
 	pushErr := p.TargetPusher.PushPack(ctx, cmds, packReader)
 	_ = packReader.Close()
 	if pushErr != nil {
@@ -197,16 +196,18 @@ func Execute(ctx context.Context, p Params, relayReason string) (Result, error) 
 	return result, nil
 }
 
-// hoistSourceHeadCommand moves the push command for the source's symref
-// HEAD target to the front of cmds. Hosts that pick the default branch
+// hoistSourceHeadPlan moves the plan whose source ref matches the
+// source's symref HEAD target to the front, so the resulting push
+// commands send that ref first. Hosts that pick the default branch
 // from the first push on a fresh repo (GitHub, GitLab) end up with the
-// right default.
-func hoistSourceHeadCommand(cmds []gitproto.PushCommand, sourceHEAD plumbing.ReferenceName) []gitproto.PushCommand {
+// right default. Matching is on SourceRef rather than TargetRef so
+// --map remappings push the correct (mapped) target ref first.
+func hoistSourceHeadPlan(plans []planner.BranchPlan, sourceHEAD plumbing.ReferenceName) []planner.BranchPlan {
 	if sourceHEAD == "" {
-		return cmds
+		return plans
 	}
-	out, _ := hoistFirstMatch(cmds, func(c gitproto.PushCommand) bool {
-		return c.Name == sourceHEAD
+	out, _ := hoistFirstMatch(plans, func(p planner.BranchPlan) bool {
+		return p.SourceRef == sourceHEAD
 	})
 	return out
 }

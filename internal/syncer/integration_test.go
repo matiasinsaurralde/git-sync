@@ -2811,6 +2811,53 @@ func TestRun_IntegrationSyncSurfacesSourceHEAD(t *testing.T) {
 	}
 }
 
+// Regression: with --map remapping source HEAD's branch to a different
+// target name, hoisting must match by source-side ref (where HEAD points)
+// and rewrite the target name, so the target server still sees the right
+// mapped ref pushed first. Without the SourceRef-based match the cmd's
+// Name (TargetRef) never equals sourceHEAD and hoisting silently skips.
+func TestRun_IntegrationBootstrapPushesSourceHeadBranchFirstUnderMapping(t *testing.T) {
+	sourceRepo, sourceFS := newSourceRepo(t)
+	makeCommits(t, sourceRepo, sourceFS, 1)
+	syncertest.SetRefAtBranch(t, sourceRepo, plumbing.NewBranchReferenceName("alpha"), testBranch)
+
+	targetRepo, err := git.Init(memory.NewStorage())
+	if err != nil {
+		t.Fatalf("init target repo: %v", err)
+	}
+
+	sourceServer := newSmartHTTPRepoServerV2(t, sourceRepo)
+	targetServer := newSmartHTTPRepoServer(t, targetRepo)
+	defer sourceServer.Close()
+	defer targetServer.Close()
+
+	var firstCommandRef plumbing.ReferenceName
+	targetServer.receivePackHook = func(req *packp.UpdateRequests, _ bool) *packp.ReportStatus {
+		if firstCommandRef == "" && len(req.Commands) > 0 {
+			firstCommandRef = req.Commands[0].Name
+		}
+		return nil
+	}
+
+	if _, err := Run(context.Background(), Config{
+		Source:       Endpoint{URL: sourceServer.RepoURL()},
+		Target:       Endpoint{URL: targetServer.RepoURL()},
+		ProtocolMode: protocolModeAuto,
+		// Map source's HEAD branch (master) to a different target name.
+		// Plus alpha mapped 1:1 to ensure the hoist isn't trivially first.
+		Mappings: []RefMapping{
+			{Source: "alpha", Target: "alpha"},
+			{Source: testBranch, Target: "stable"},
+		},
+	}); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	want := plumbing.NewBranchReferenceName("stable")
+	if firstCommandRef != want {
+		t.Errorf("first receive-pack command = %q, want %q (mapped target of source HEAD's branch should be pushed first)", firstCommandRef, want)
+	}
+}
+
 // Bootstrap pushes the source HEAD's branch as the first ref command, so
 // hosts that pick the default branch from the first push on a fresh repo
 // (GitHub, GitLab) end up with the right default. Source has an alpha

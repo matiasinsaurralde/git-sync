@@ -22,61 +22,62 @@ import (
 	"entire.io/entire/git-sync/internal/planner"
 )
 
-func TestHoistSourceHeadCommand(t *testing.T) {
+func TestHoistSourceHeadPlan(t *testing.T) {
 	main := plumbing.NewBranchReferenceName("main")
 	master := plumbing.NewBranchReferenceName("master")
 	alpha := plumbing.NewBranchReferenceName("alpha")
+	stable := plumbing.NewBranchReferenceName("stable")
 
-	cmd := func(name plumbing.ReferenceName) gitproto.PushCommand {
-		return gitproto.PushCommand{Name: name}
+	plan := func(source, target plumbing.ReferenceName) planner.BranchPlan {
+		return planner.BranchPlan{SourceRef: source, TargetRef: target}
 	}
 
 	tests := []struct {
-		name   string
-		cmds   []gitproto.PushCommand
-		head   plumbing.ReferenceName
-		wanted []plumbing.ReferenceName
+		name           string
+		plans          []planner.BranchPlan
+		head           plumbing.ReferenceName
+		wantTargetRefs []plumbing.ReferenceName
 	}{
 		{
-			name:   "hoists matching command to front",
-			cmds:   []gitproto.PushCommand{cmd(alpha), cmd(main), cmd(master)},
-			head:   main,
-			wanted: []plumbing.ReferenceName{main, alpha, master},
+			name:           "hoists matching plan to front",
+			plans:          []planner.BranchPlan{plan(alpha, alpha), plan(main, main), plan(master, master)},
+			head:           main,
+			wantTargetRefs: []plumbing.ReferenceName{main, alpha, master},
 		},
 		{
-			name:   "already first stays put",
-			cmds:   []gitproto.PushCommand{cmd(main), cmd(alpha)},
-			head:   main,
-			wanted: []plumbing.ReferenceName{main, alpha},
+			name:           "matches on SourceRef, hoists mapped TargetRef",
+			plans:          []planner.BranchPlan{plan(alpha, alpha), plan(master, stable)},
+			head:           master,
+			wantTargetRefs: []plumbing.ReferenceName{stable, alpha},
 		},
 		{
-			name:   "empty source HEAD is a no-op",
-			cmds:   []gitproto.PushCommand{cmd(alpha), cmd(main)},
-			head:   "",
-			wanted: []plumbing.ReferenceName{alpha, main},
+			name:           "already first stays put",
+			plans:          []planner.BranchPlan{plan(main, main), plan(alpha, alpha)},
+			head:           main,
+			wantTargetRefs: []plumbing.ReferenceName{main, alpha},
 		},
 		{
-			name:   "no matching command is a no-op",
-			cmds:   []gitproto.PushCommand{cmd(alpha), cmd(master)},
-			head:   main,
-			wanted: []plumbing.ReferenceName{alpha, master},
+			name:           "empty source HEAD is a no-op",
+			plans:          []planner.BranchPlan{plan(alpha, alpha), plan(main, main)},
+			head:           "",
+			wantTargetRefs: []plumbing.ReferenceName{alpha, main},
 		},
 		{
-			name:   "single command",
-			cmds:   []gitproto.PushCommand{cmd(main)},
-			head:   main,
-			wanted: []plumbing.ReferenceName{main},
+			name:           "no matching plan is a no-op",
+			plans:          []planner.BranchPlan{plan(alpha, alpha), plan(master, master)},
+			head:           main,
+			wantTargetRefs: []plumbing.ReferenceName{alpha, master},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := hoistSourceHeadCommand(tt.cmds, tt.head)
-			if len(got) != len(tt.wanted) {
-				t.Fatalf("length mismatch: got %d, want %d", len(got), len(tt.wanted))
+			got := hoistSourceHeadPlan(tt.plans, tt.head)
+			if len(got) != len(tt.wantTargetRefs) {
+				t.Fatalf("length mismatch: got %d, want %d", len(got), len(tt.wantTargetRefs))
 			}
-			for i, want := range tt.wanted {
-				if got[i].Name != want {
-					t.Errorf("position %d: got %q, want %q", i, got[i].Name, want)
+			for i, want := range tt.wantTargetRefs {
+				if got[i].TargetRef != want {
+					t.Errorf("position %d: got %q, want %q", i, got[i].TargetRef, want)
 				}
 			}
 		})
