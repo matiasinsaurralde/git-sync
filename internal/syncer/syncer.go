@@ -130,8 +130,6 @@ func (r RefInfo) MarshalJSON() ([]byte, error) {
 }
 
 // Result holds the outcome of a sync or bootstrap operation.
-// SourceHEAD carries the source's symref HEAD target when advertised; lets
-// callers compare against the target's intended default branch.
 type Result struct {
 	Plans              []BranchPlan           `json:"plans"`
 	Pushed             int                    `json:"pushed"`
@@ -514,15 +512,6 @@ type syncSession struct {
 	rejections map[plumbing.ReferenceName]string
 }
 
-// sourceHead returns the source's symref HEAD target (possibly empty when
-// source has detached HEAD or hasn't been set up).
-func (s *syncSession) sourceHead() plumbing.ReferenceName {
-	if s.sourceService == nil {
-		return ""
-	}
-	return s.sourceService.HeadTarget
-}
-
 // finish releases any resources owned by the session — currently the live
 // progress ticker. Idempotent and safe to call from defer in callers that
 // also produce results in the happy path.
@@ -707,7 +696,7 @@ func (s *syncSession) runSync(ctx context.Context) (Result, error) {
 				Plans: plans, DryRun: true, RelayReason: reason,
 				OperationMode: modeSync, BootstrapSuggested: true, Stats: stats.snapshot(),
 				Measurement: measurementDone(), Protocol: sourceService.Protocol,
-				SourceHEAD: s.sourceHead(),
+				SourceHEAD: s.sourceService.HeadTarget,
 			}, nil
 		}
 		return bootstrapWithInputs(ctx, s, desiredRefs, targetRefMap, reason)
@@ -751,7 +740,7 @@ func (s *syncSession) runSync(ctx context.Context) (Result, error) {
 	result := Result{
 		Plans: plans, DryRun: s.cfg.DryRun, OperationMode: modeSync, Protocol: sourceService.Protocol,
 		Stats: stats.snapshot(), Measurement: measurementDone(),
-		SourceHEAD: s.sourceHead(),
+		SourceHEAD: s.sourceService.HeadTarget,
 	}
 
 	pushPlans := make([]BranchPlan, 0, len(plans))
@@ -837,7 +826,7 @@ func (s *syncSession) runReplicate(ctx context.Context) (Result, error) {
 				Stats:              s.stats.snapshot(),
 				Measurement:        s.measurementDone(),
 				Protocol:           s.sourceService.Protocol,
-				SourceHEAD:         s.sourceHead(),
+				SourceHEAD:         s.sourceService.HeadTarget,
 			}, nil
 		}
 		return bootstrapWithInputs(ctx, s, desiredRefs, s.target.refMap, "empty-target-managed-refs")
@@ -855,7 +844,7 @@ func (s *syncSession) runReplicate(ctx context.Context) (Result, error) {
 		Protocol:      s.sourceService.Protocol,
 		Stats:         s.stats.snapshot(),
 		Measurement:   s.measurementDone(),
-		SourceHEAD:    s.sourceHead(),
+		SourceHEAD:    s.sourceService.HeadTarget,
 	}
 
 	pushPlans := make([]BranchPlan, 0, len(plans))
@@ -1052,7 +1041,7 @@ func bootstrapWithInputs(
 		Batching: bResult.Batching, BatchCount: bResult.BatchCount,
 		PlannedBatchCount: bResult.PlannedBatchCount, TempRefs: bResult.TempRefs,
 		Stats: s.stats.snapshot(), Measurement: s.measurementDone(), Protocol: s.sourceService.Protocol,
-		SourceHEAD: s.sourceHead(),
+		SourceHEAD: s.sourceService.HeadTarget,
 	}, nil
 }
 
@@ -1152,7 +1141,7 @@ func (s *syncSession) newProbeResult() ProbeResult {
 		RefPrefixes:   planner.RefPrefixes(planConfig(s.cfg)),
 		Capabilities:  s.sourceService.Capabilities(),
 		Refs:          refInfos,
-		SourceHEAD:    s.sourceHead(),
+		SourceHEAD:    s.sourceService.HeadTarget,
 		Stats:         s.stats.snapshot(),
 		Measurement:   s.measurementDone(),
 	}

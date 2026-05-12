@@ -197,28 +197,39 @@ func Execute(ctx context.Context, p Params, relayReason string) (Result, error) 
 	return result, nil
 }
 
-// hoistSourceHeadCommand moves the push command whose ref matches the
-// source's symref HEAD target to the front of cmds. Hosts that pick the
-// default branch from the first push on a fresh repo (GitHub, GitLab) end
-// up with the right default. No-op when sourceHEAD is empty or not in cmds.
+// hoistSourceHeadCommand moves the push command for the source's symref
+// HEAD target to the front of cmds. Hosts that pick the default branch
+// from the first push on a fresh repo (GitHub, GitLab) end up with the
+// right default.
 func hoistSourceHeadCommand(cmds []gitproto.PushCommand, sourceHEAD plumbing.ReferenceName) []gitproto.PushCommand {
-	if sourceHEAD == "" || len(cmds) < 2 {
+	if sourceHEAD == "" {
 		return cmds
 	}
-	for i, cmd := range cmds {
-		if cmd.Name != sourceHEAD {
+	out, _ := hoistFirstMatch(cmds, func(c gitproto.PushCommand) bool {
+		return c.Name == sourceHEAD
+	})
+	return out
+}
+
+// hoistFirstMatch moves the first element satisfying match to the front
+// of xs. Returns the (possibly new) slice and the original index of the
+// hoisted element (-1 when no match). When the match is already at
+// position 0, returns the input slice unchanged.
+func hoistFirstMatch[T any](xs []T, match func(T) bool) ([]T, int) {
+	for i, x := range xs {
+		if !match(x) {
 			continue
 		}
 		if i == 0 {
-			return cmds
+			return xs, 0
 		}
-		out := make([]gitproto.PushCommand, 0, len(cmds))
-		out = append(out, cmd)
-		out = append(out, cmds[:i]...)
-		out = append(out, cmds[i+1:]...)
-		return out
+		out := make([]T, 0, len(xs))
+		out = append(out, x)
+		out = append(out, xs[:i]...)
+		out = append(out, xs[i+1:]...)
+		return out, i
 	}
-	return cmds
+	return xs, -1
 }
 
 func adjustedBootstrapTargetRefs(
@@ -792,19 +803,13 @@ func orderTrunkFirst(desired []planner.DesiredRef, sourceHeadTarget plumbing.Ref
 	if sourceHeadTarget == "" {
 		return desired, -1
 	}
-	for i, ref := range desired {
-		if ref.SourceRef == sourceHeadTarget {
-			if i == 0 {
-				return desired, 0
-			}
-			reordered := make([]planner.DesiredRef, 0, len(desired))
-			reordered = append(reordered, ref)
-			reordered = append(reordered, desired[:i]...)
-			reordered = append(reordered, desired[i+1:]...)
-			return reordered, 0
-		}
+	reordered, idx := hoistFirstMatch(desired, func(r planner.DesiredRef) bool {
+		return r.SourceRef == sourceHeadTarget
+	})
+	if idx < 0 {
+		return desired, -1
 	}
-	return desired, -1
+	return reordered, 0
 }
 
 // PlanCheckpoints plans the checkpoint hashes for a single branch during batched bootstrap.

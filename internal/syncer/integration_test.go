@@ -2819,13 +2819,7 @@ func TestRun_IntegrationSyncSurfacesSourceHEAD(t *testing.T) {
 func TestRun_IntegrationBootstrapPushesSourceHeadBranchFirst(t *testing.T) {
 	sourceRepo, sourceFS := newSourceRepo(t)
 	makeCommits(t, sourceRepo, sourceFS, 1)
-	head, err := sourceRepo.Reference(plumbing.NewBranchReferenceName(testBranch), true)
-	if err != nil {
-		t.Fatalf("resolve source head: %v", err)
-	}
-	if err := sourceRepo.Storer.SetReference(plumbing.NewHashReference(plumbing.NewBranchReferenceName("alpha"), head.Hash())); err != nil {
-		t.Fatalf("set alpha branch: %v", err)
-	}
+	syncertest.SetRefAtBranch(t, sourceRepo, plumbing.NewBranchReferenceName("alpha"), testBranch)
 
 	targetRepo, err := git.Init(memory.NewStorage())
 	if err != nil {
