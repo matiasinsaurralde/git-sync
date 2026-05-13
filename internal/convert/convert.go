@@ -60,7 +60,16 @@ func PlansToPushPlans(plans []planner.BranchPlan) []gitproto.PushPlan {
 }
 
 // PlansToPushCommands converts planner BranchPlans directly to gitproto PushCommands.
-func PlansToPushCommands(plans []planner.BranchPlan) []gitproto.PushCommand {
+//
+// When forceBlind is true, the expected-old hash is zeroed for non-delete
+// commands. This tells receive-pack to overwrite regardless of the current
+// target tip — matching `git push --force` semantics. Delete commands always
+// carry the captured target hash so the server can confirm what it is removing.
+//
+// When forceBlind is false (the default), commands carry the target hash
+// captured at session start; receive-pack rejects updates where the target
+// moved during the run, providing per-run `--force-with-lease` protection.
+func PlansToPushCommands(plans []planner.BranchPlan, forceBlind bool) []gitproto.PushCommand {
 	out := make([]gitproto.PushCommand, len(plans))
 	for i, p := range plans {
 		out[i] = gitproto.PushCommand{
@@ -71,6 +80,8 @@ func PlansToPushCommands(plans []planner.BranchPlan) []gitproto.PushCommand {
 		}
 		if out[i].Delete {
 			out[i].New = plumbing.ZeroHash
+		} else if forceBlind {
+			out[i].Old = plumbing.ZeroHash
 		}
 	}
 	return out

@@ -228,12 +228,13 @@ func bridgeScope(scope RefScope) internalbridge.RefScope {
 
 func bridgePolicy(policy SyncPolicy) internalbridge.SyncPolicy {
 	return internalbridge.SyncPolicy{
-		Mode:        internalbridge.OperationMode(policy.Mode),
-		IncludeTags: policy.IncludeTags,
-		Force:       policy.Force,
-		Prune:       policy.Prune,
-		BestEffort:  policy.BestEffort,
-		Protocol:    internalbridge.ProtocolMode(policy.Protocol),
+		Mode:           internalbridge.OperationMode(policy.Mode),
+		IncludeTags:    policy.IncludeTags,
+		ForceWithLease: policy.ForceWithLease,
+		ForceBlind:     policy.ForceBlind,
+		Prune:          policy.Prune,
+		BestEffort:     policy.BestEffort,
+		Protocol:       internalbridge.ProtocolMode(policy.Protocol),
 	}
 }
 
