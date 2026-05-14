@@ -52,8 +52,12 @@ func (c *SSHConn) RequestInfoRefs(ctx context.Context, service string, gitProtoc
 	if err != nil {
 		return nil, err
 	}
+	return requestInfoRefsWithCommand(ctx, service, cmd, stderr)
+}
+
+func requestInfoRefsWithCommand(ctx context.Context, service string, cmd *sshCommand, stderr *sshCommandError) ([]byte, error) {
 	if err := cmd.Stdin.Close(); err != nil {
-		return nil, fmt.Errorf("close ssh stdin for %s: %w", service, err)
+		return nil, fmt.Errorf("close ssh stdin for %s: %w", service, errors.Join(err, cleanupSSHCommand(cmd)))
 	}
 	data, readErr := io.ReadAll(cmd.Stdout)
 	waitErr := cmd.wait()
@@ -191,13 +195,33 @@ type sshCommand struct {
 	Cmd    *exec.Cmd
 	Stdin  io.WriteCloser
 	Stdout io.ReadCloser
+	waitFn func() error
 }
 
 func (c *sshCommand) wait() error {
+	if c.waitFn != nil {
+		return c.waitFn()
+	}
 	if err := c.Cmd.Wait(); err != nil {
 		return fmt.Errorf("wait for ssh command: %w", err)
 	}
 	return nil
+}
+
+func cleanupSSHCommand(cmd *sshCommand) error {
+	if cmd == nil {
+		return nil
+	}
+	var errs []error
+	if cmd.Stdout != nil {
+		if err := cmd.Stdout.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close ssh stdout: %w", err))
+		}
+	}
+	if err := cmd.wait(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 func discardSSHAdvertisement(stdout io.ReadCloser) (io.ReadCloser, error) {

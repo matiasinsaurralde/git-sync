@@ -168,11 +168,47 @@ func TestSSHConnPostRPCStreamBodyHonorsContext(t *testing.T) {
 	}
 }
 
+func TestRequestInfoRefsCleansUpWhenStdinCloseFails(t *testing.T) {
+	t.Parallel()
+
+	stdoutClosed := false
+	waitCalled := false
+	_, err := requestInfoRefsWithCommand(
+		t.Context(),
+		"git-upload-pack",
+		&sshCommand{
+			Stdin:  closeWriterFunc(func() error { return errors.New("close failed") }),
+			Stdout: closeReaderFunc(func() error { stdoutClosed = true; return nil }),
+			waitFn: func() error { waitCalled = true; return nil },
+		},
+		&sshCommandError{},
+	)
+	if err == nil || !strings.Contains(err.Error(), "close ssh stdin for git-upload-pack") {
+		t.Fatalf("requestInfoRefsWithCommand error = %v", err)
+	}
+	if !stdoutClosed {
+		t.Fatal("stdout was not closed on stdin-close failure")
+	}
+	if !waitCalled {
+		t.Fatal("wait was not called on stdin-close failure")
+	}
+}
+
 type sshShimEnv struct {
 	script     string
 	logFile    string
 	bodyPrefix string
 }
+
+type closeWriterFunc func() error
+
+func (f closeWriterFunc) Write(p []byte) (int, error) { return len(p), nil }
+func (f closeWriterFunc) Close() error                { return f() }
+
+type closeReaderFunc func() error
+
+func (f closeReaderFunc) Read([]byte) (int, error) { return 0, io.EOF }
+func (f closeReaderFunc) Close() error             { return f() }
 
 func newSSHShimEnv(t *testing.T) sshShimEnv {
 	t.Helper()
