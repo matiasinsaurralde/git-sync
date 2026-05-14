@@ -3,8 +3,8 @@ package gitproto
 import (
 	"testing"
 
-	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/protocol/capability"
+	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 )
 
 func TestTargetFeaturesFromAdvRefs(t *testing.T) {

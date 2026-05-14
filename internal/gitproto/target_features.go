@@ -1,8 +1,8 @@
 package gitproto
 
 import (
-	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/protocol/capability"
+	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 )
 
 // TargetFeatures summarizes the receive-pack capabilities relevant to strategy

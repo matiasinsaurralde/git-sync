@@ -11,8 +11,8 @@ import (
 
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/format/pktline"
-	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/protocol/capability"
+	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 )
 
@@ -105,11 +105,11 @@ func AdvRefsCaps(adv *packp.AdvRefs) []string {
 	for _, cap := range all {
 		values := adv.Capabilities.Get(cap)
 		if len(values) == 0 {
-			items = append(items, string(cap))
+			items = append(items, cap)
 			continue
 		}
 		for _, value := range values {
-			items = append(items, string(cap)+"="+value)
+			items = append(items, cap+"="+value)
 		}
 	}
 	return items
