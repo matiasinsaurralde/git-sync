@@ -1,6 +1,7 @@
 package gitproto
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -62,6 +63,9 @@ func (c *SSHConn) RequestInfoRefs(ctx context.Context, service string, gitProtoc
 	if readErr != nil {
 		return nil, fmt.Errorf("%s info-refs: %w", service, readErr)
 	}
+	if len(data) > 0 {
+		return data, nil
+	}
 	if waitErr != nil {
 		return nil, fmt.Errorf("%s info-refs: %w", service, stderr.wrap(waitErr))
 	}
@@ -88,9 +92,15 @@ func (c *SSHConn) PostRPCStreamBody(ctx context.Context, service string, body io
 		}
 		copyErr <- closeErr
 	}()
+	stdout, err := discardSSHAdvertisement(cmd.Stdout)
+	if err != nil {
+		_ = cmd.Stdout.Close()
+		_ = cmd.wait()
+		return nil, fmt.Errorf("%s advertisement: %w", service, stderr.wrap(err))
+	}
 	return &sshRPCStream{
 		ctx:     ctx,
-		stdout:  cmd.Stdout,
+		stdout:  stdout,
 		wait:    cmd.wait,
 		copyErr: copyErr,
 		stderr:  stderr,
@@ -174,6 +184,45 @@ type sshCommand struct {
 
 func (c *sshCommand) wait() error { return c.Cmd.Wait() }
 
+func discardSSHAdvertisement(stdout io.ReadCloser) (io.ReadCloser, error) {
+	buffered := bufio.NewReader(stdout)
+	header, err := buffered.Peek(4)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return &bufferedReadCloser{Reader: buffered, Closer: stdout}, nil
+		}
+		return nil, err
+	}
+	if !looksLikePktlineHeader(header) {
+		return &bufferedReadCloser{Reader: buffered, Closer: stdout}, nil
+	}
+	reader := NewPacketReader(buffered)
+	for {
+		kind, _, err := reader.ReadPacket()
+		if err != nil {
+			return nil, err
+		}
+		if kind == PacketFlush {
+			break
+		}
+	}
+	return &bufferedReadCloser{Reader: reader.BufReader(), Closer: stdout}, nil
+}
+
+func looksLikePktlineHeader(header []byte) bool {
+	if len(header) != 4 {
+		return false
+	}
+	var fixed [4]byte
+	copy(fixed[:], header)
+	switch string(fixed[:]) {
+	case "0000", "0001", "0002":
+		return true
+	}
+	_, err := parseHexLength(fixed)
+	return err == nil
+}
+
 type sshRPCStream struct {
 	ctx     context.Context
 	stdout  io.ReadCloser
@@ -183,6 +232,11 @@ type sshRPCStream struct {
 
 	waitOnce sync.Once
 	waitErr  error
+}
+
+type bufferedReadCloser struct {
+	*bufio.Reader
+	io.Closer
 }
 
 func (s *sshRPCStream) Read(p []byte) (int, error) {

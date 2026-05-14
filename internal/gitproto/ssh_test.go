@@ -75,7 +75,7 @@ func TestSSHConnPostRPCStreamBodyCanBeCalledRepeatedly(t *testing.T) {
 	env := newSSHShimEnv(t)
 	conn := newSSHTestConn(t, "ssh://example.com/repo.git", env.script)
 
-	reader1, err := conn.PostRPCStreamBody(t.Context(), "git-upload-pack", strings.NewReader("first-body"), true, "fetch one")
+	reader1, err := conn.PostRPCStreamBody(t.Context(), "git-upload-pack", strings.NewReader("first-body"), false, "fetch one")
 	if err != nil {
 		t.Fatalf("PostRPCStreamBody first: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestSSHConnPostRPCStreamBodyCanBeCalledRepeatedly(t *testing.T) {
 		t.Fatalf("close first response: %v", err)
 	}
 
-	reader2, err := conn.PostRPCStreamBody(t.Context(), "git-upload-pack", strings.NewReader("second-body"), true, "fetch two")
+	reader2, err := conn.PostRPCStreamBody(t.Context(), "git-upload-pack", strings.NewReader("second-body"), false, "fetch two")
 	if err != nil {
 		t.Fatalf("PostRPCStreamBody second: %v", err)
 	}
