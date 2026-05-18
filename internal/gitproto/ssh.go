@@ -80,7 +80,7 @@ func (c *SSHConn) PostRPCStreamBody(ctx context.Context, service string, body io
 	_ = phase // phase labels are HTTP-only today; SSH transport has no per-RPC stats tagging
 	gitProtocol := ""
 	if v2 {
-		gitProtocol = "version=2"
+		gitProtocol = GitProtocolV2
 	}
 	cmd, stderr, err := c.startRPC(ctx, service, gitProtocol)
 	if err != nil {

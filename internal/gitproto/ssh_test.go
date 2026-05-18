@@ -35,7 +35,7 @@ func TestSSHConnRequestInfoRefsHonorsUserConfigAndProtocolV2(t *testing.T) {
 	env := newSSHShimEnv(t)
 	conn := newSSHTestConn(t, "ssh://example.com/repo.git", env.script)
 
-	body, err := conn.RequestInfoRefs(t.Context(), "git-upload-pack", "version=2")
+	body, err := conn.RequestInfoRefs(t.Context(), "git-upload-pack", GitProtocolV2)
 	if err != nil {
 		t.Fatalf("RequestInfoRefs: %v", err)
 	}

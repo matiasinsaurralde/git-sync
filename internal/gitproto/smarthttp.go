@@ -262,7 +262,7 @@ func (c *HTTPConn) PostRPCStreamBody(ctx context.Context, service string, body i
 	req.Header.Set("User-Agent", capability.DefaultAgent())
 	req.Header.Set(StatsPhaseHeader, phase)
 	if v2 {
-		req.Header.Set("Git-Protocol", "version=2")
+		req.Header.Set("Git-Protocol", GitProtocolV2)
 	}
 	ApplyAuth(req, c.Auth)
 

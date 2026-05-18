@@ -151,7 +151,7 @@ func TestRequestInfoRefsContextCanceled(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := RequestInfoRefs(ctx, conn, "git-upload-pack", "version=2")
+		_, err := RequestInfoRefs(ctx, conn, "git-upload-pack", GitProtocolV2)
 		done <- err
 	}()
 

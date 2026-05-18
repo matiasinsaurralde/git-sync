@@ -203,13 +203,13 @@ func TestListSourceRefsUnsupportedProtocol(t *testing.T) {
 	}
 }
 
-func TestListSourceRefsAutoFallsBackToV1AfterSSHV2ProbeCommandRejection(t *testing.T) {
+func TestListSourceRefsAutoFallsBackToV1AfterSSHV2ProbeError(t *testing.T) {
 	t.Parallel()
 
 	conn := &stubConn{
 		reqInfoRefs: func(_ context.Context, _ string, gitProtocol string) ([]byte, error) {
-			if gitProtocol == "version=2" {
-				return nil, errors.New("request info refs: git-upload-pack info-refs: wait for ssh command: exit status 1: Invalid command: GIT_PROTOCOL='version=2' git-upload-pack 'entireio/cli.git'")
+			if gitProtocol == GitProtocolV2 {
+				return nil, errors.New("ssh server rejected v2 probe")
 			}
 
 			var body strings.Builder
@@ -254,8 +254,63 @@ func TestListSourceRefsAutoFallsBackToV1AfterSSHV2ProbeCommandRejection(t *testi
 	}
 }
 
+func TestListSourceRefsAutoJoinsErrorsWhenV1FallbackAlsoFails(t *testing.T) {
+	t.Parallel()
+
+	v2Err := errors.New("ssh v2 probe failed")
+	v1Err := errors.New("ssh v1 fallback failed")
+	conn := &stubConn{
+		reqInfoRefs: func(_ context.Context, _ string, gitProtocol string) ([]byte, error) {
+			if gitProtocol == GitProtocolV2 {
+				return nil, v2Err
+			}
+			return nil, v1Err
+		},
+	}
+
+	_, _, err := ListSourceRefs(t.Context(), conn, "auto", nil)
+	if err == nil {
+		t.Fatal("expected error when both v2 probe and v1 fallback fail")
+	}
+	if !errors.Is(err, v2Err) {
+		t.Errorf("err does not wrap v2 error: %v", err)
+	}
+	if !errors.Is(err, v1Err) {
+		t.Errorf("err does not wrap v1 error: %v", err)
+	}
+}
+
+func TestListSourceRefsAutoDoesNotFallBackForNonSSH(t *testing.T) {
+	t.Parallel()
+
+	v2Err := errors.New("https v2 probe failed")
+	v1Called := false
+	conn := &stubConn{
+		reqInfoRefs: func(_ context.Context, _ string, gitProtocol string) ([]byte, error) {
+			if gitProtocol == GitProtocolV2 {
+				return nil, v2Err
+			}
+			v1Called = true
+			return nil, errors.New("unexpected v1 call")
+		},
+		endpoint: &url.URL{Scheme: "https", Host: "github.com"},
+	}
+
+	_, _, err := ListSourceRefs(t.Context(), conn, "auto", nil)
+	if err == nil {
+		t.Fatal("expected error from v2 probe")
+	}
+	if !errors.Is(err, v2Err) {
+		t.Errorf("err does not wrap v2 error: %v", err)
+	}
+	if v1Called {
+		t.Error("v1 fallback should not be attempted for non-SSH schemes")
+	}
+}
+
 type stubConn struct {
 	reqInfoRefs func(ctx context.Context, service string, gitProtocol string) ([]byte, error)
+	endpoint    *url.URL
 }
 
 func (s *stubConn) RequestInfoRefs(ctx context.Context, service string, gitProtocol string) ([]byte, error) {
@@ -266,7 +321,12 @@ func (s *stubConn) PostRPCStreamBody(context.Context, string, io.Reader, bool, s
 	return nil, errors.New("unexpected PostRPCStreamBody call")
 }
 
-func (s *stubConn) Endpoint() *url.URL { return &url.URL{Scheme: "ssh", Host: "github.com"} }
+func (s *stubConn) Endpoint() *url.URL {
+	if s.endpoint != nil {
+		return s.endpoint
+	}
+	return &url.URL{Scheme: "ssh", Host: "github.com"}
+}
 
 func (s *stubConn) ProgressWriter() io.Writer { return nil }
 

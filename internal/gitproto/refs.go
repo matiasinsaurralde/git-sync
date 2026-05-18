@@ -16,6 +16,10 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/transport"
 )
 
+// GitProtocolV2 is the value passed via the Git-Protocol header / GIT_PROTOCOL
+// env var to negotiate protocol v2 with the remote.
+const GitProtocolV2 = "version=2"
+
 // RefService encapsulates the result of source ref discovery and the negotiated
 // protocol, providing methods for subsequent fetch and pack operations.
 type RefService struct {
@@ -44,10 +48,14 @@ func ListSourceRefs(ctx context.Context, conn Conn, protocolMode string, refPref
 		return refs, &RefService{Protocol: "v1", V1Adv: adv, HeadTarget: headTargetFromAdv(adv)}, nil
 
 	case "auto", "v2":
-		data, err := RequestInfoRefs(ctx, conn, transport.UploadPackService, "version=2")
+		data, err := RequestInfoRefs(ctx, conn, transport.UploadPackService, GitProtocolV2)
 		if err != nil {
-			if protocolMode == "auto" && shouldFallbackToV1AfterV2ProbeError(conn, err) {
-				return listSourceRefsAutoV1(ctx, conn)
+			if protocolMode == "auto" && isSSHScheme(conn) {
+				refs, svc, v1Err := listSourceRefsAutoV1(ctx, conn)
+				if v1Err != nil {
+					return nil, nil, errors.Join(err, v1Err)
+				}
+				return refs, svc, nil
 			}
 			return nil, nil, err
 		}
@@ -88,20 +96,15 @@ func listSourceRefsAutoV1(ctx context.Context, conn Conn) ([]*plumbing.Reference
 	return refs, &RefService{Protocol: "v1", V1Adv: adv, HeadTarget: headTargetFromAdv(adv)}, nil
 }
 
-func shouldFallbackToV1AfterV2ProbeError(conn Conn, err error) bool {
+func isSSHScheme(conn Conn) bool {
 	if conn == nil || conn.Endpoint() == nil {
 		return false
 	}
 	switch conn.Endpoint().Scheme {
 	case "ssh", "git+ssh":
-	default:
-		return false
+		return true
 	}
-
-	msg := err.Error()
-	return strings.Contains(msg, "Invalid command:") &&
-		strings.Contains(msg, "GIT_PROTOCOL='version=2'") &&
-		strings.Contains(msg, "git-upload-pack")
+	return false
 }
 
 // AdvertisedRefsV1 fetches and decodes v1 advertised refs for the given service.
