@@ -9,6 +9,7 @@ import (
 	"mime"
 	"net/http"
 	"net/http/httptrace"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
@@ -128,6 +129,46 @@ func withHTTPTrace(ctx context.Context, label string) context.Context {
 		},
 	}
 	return httptrace.WithClientTrace(ctx, trace)
+}
+
+// dumpOutgoingRequest prints the wire-format request line and headers for
+// req to stderr, prefixed with label. The body is not consumed (passes
+// body=false to httputil.DumpRequestOut), but Transfer-Encoding and
+// Content-Length will reflect what Go's transport would actually send.
+// Useful when a server behaves unexpectedly on a POST and you need to
+// see what the request looked like at the protocol level — the
+// connection-level trace tells you which TCP/TLS connection was used
+// but not what was written on it. Best-effort: dump errors are
+// surfaced as a single line so a transient dump failure doesn't mask
+// the underlying request.
+func dumpOutgoingRequest(req *http.Request, label string) {
+	dump, err := httputil.DumpRequestOut(req, false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[httptrace] %s dump error: %v\n", label, err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[httptrace] %s outgoing request:\n%s\n", label, redactAuthorization(dump))
+}
+
+// redactAuthorization scrubs any Authorization header value from a dumped
+// HTTP request so the credentials don't leak into stderr when
+// GITSYNC_HTTP_TRACE is enabled in environments with shoulder-surfers,
+// pasted-into-tickets logs, or shared shells.
+func redactAuthorization(dump []byte) []byte {
+	const header = "Authorization:"
+	idx := bytes.Index(dump, []byte(header))
+	if idx < 0 {
+		return dump
+	}
+	end := bytes.IndexByte(dump[idx:], '\n')
+	if end < 0 {
+		end = len(dump) - idx
+	}
+	out := make([]byte, 0, len(dump))
+	out = append(out, dump[:idx]...)
+	out = append(out, []byte(header+" [REDACTED]")...)
+	out = append(out, dump[idx+end:]...)
+	return out
 }
 
 // AuthMethod authorizes outbound HTTP requests for a remote. It is satisfied
@@ -352,6 +393,10 @@ func (c *HTTPConn) PostRPCStreamBody(ctx context.Context, service string, body i
 		req.Header.Set("Git-Protocol", GitProtocolV2)
 	}
 	ApplyAuth(req, c.Auth)
+
+	if httpTraceEnabled() {
+		dumpOutgoingRequest(req, "POST "+service)
+	}
 
 	res, err := c.HTTP.Do(req)
 	if err != nil {
