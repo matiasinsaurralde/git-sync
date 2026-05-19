@@ -154,6 +154,21 @@ func sendReceivePack(
 	if packData != nil {
 		body = io.MultiReader(body, packData)
 	}
+	return postReceivePack(ctx, conn, req, body, verbose, onRejection)
+}
+
+// postReceivePack POSTs an already-built receive-pack request body and
+// decodes the response. Split from sendReceivePack so the materialized
+// push path can construct a spooled body (header + pack in one temp
+// file) and reuse the response handling.
+func postReceivePack(
+	ctx context.Context,
+	conn Conn,
+	req *packp.UpdateRequests,
+	body io.Reader,
+	verbose bool,
+	onRejection func(plumbing.ReferenceName, string),
+) error {
 	reader, err := PostRPCStreamBody(ctx, conn, transport.ReceivePackService, body, false, "receive-pack push")
 	if err != nil {
 		return fmt.Errorf("target receive-pack: %w", err)
@@ -199,6 +214,28 @@ func sendReceivePack(
 }
 
 // PushObjects pushes locally-materialized objects to the target.
+//
+// The receive-pack body (update-request header + pack) is written to a
+// temp file before the POST so the upload goes out in one continuous
+// burst. go-git's encoder runs delta selection synchronously before
+// writing any pack bytes, which on big repos stalls the request body
+// for tens of seconds — long enough for CDN edges like Cloudflare's to
+// hit their idle-write timeout and close the connection mid-upload.
+// Spooling collapses encoding and writing into one phase from the
+// network's point of view, so the body bytes stream out without gaps.
+//
+// As a side benefit the spooled body carries a known length, so the
+// POST sends Content-Length instead of Transfer-Encoding: chunked
+// (matching upstream git's smart-HTTP transport), and req.GetBody lets
+// Go's transport retry transient connection failures.
+//
+// The materialized strategy already requires the full source object
+// closure to be local before encoding begins, so a temp file on upload
+// doesn't change its fundamental shape. Relay paths (PushPack) keep
+// streaming source bytes through to target with chunked encoding —
+// source pack data flows steadily, there's no stall to engineer
+// around, and the "streaming proxy" property git-sync is built around
+// is preserved.
 func PushObjects(
 	ctx context.Context,
 	conn Conn,
@@ -218,25 +255,21 @@ func PushObjects(
 	}
 
 	useRefDeltas := !adv.Capabilities.Supports(capability.OFSDelta)
-	pr, pw := io.Pipe()
-	done := make(chan error, 1)
-
-	go func() {
-		enc := packfile.NewEncoder(pw, store, useRefDeltas)
-		if _, err := enc.Encode(hashes, 10); err != nil {
-			done <- pw.CloseWithError(fmt.Errorf("encode packfile: %w", err))
-			return
+	spooled, cleanup, err := NewSpooledBody(func(w io.Writer) error {
+		if err := req.Encode(w); err != nil {
+			return fmt.Errorf("encode update-request: %w", err)
 		}
-		done <- pw.Close()
-	}()
-
-	err = sendReceivePack(ctx, conn, req, pr, verbose, onRejection)
-	_ = pr.Close()
-	encodeErr := <-done
+		enc := packfile.NewEncoder(w, store, useRefDeltas)
+		if _, err := enc.Encode(hashes, 10); err != nil {
+			return fmt.Errorf("encode packfile: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	return encodeErr
+	defer cleanup()
+	return postReceivePack(ctx, conn, req, spooled, verbose, onRejection)
 }
 
 // PushPack pushes a pack stream (relay) to the target.

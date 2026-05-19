@@ -378,12 +378,30 @@ func PostRPCStreamBody(ctx context.Context, conn Conn, service string, body io.R
 
 // PostRPCStreamBody sends a POST to the given service using a streaming request body.
 // Caller must close the returned ReadCloser.
+//
+// The body is sent as-is. Streaming bodies (io.MultiReader, io.PipeReader)
+// produce a chunked request — that's the right shape for relay paths,
+// where source pack bytes flow steadily from source through to target.
+// Callers whose body would otherwise stall mid-stream (e.g. the
+// materialized push path, where the encoder's delta-selection phase
+// produces no bytes for tens of seconds) spool the full payload first
+// and pass a *SpooledBody; PostRPCStreamBody sets req.ContentLength and
+// req.GetBody from its fields so the upload goes out in one continuous
+// burst and Go's transport can auto-retry transient connection failures.
 func (c *HTTPConn) PostRPCStreamBody(ctx context.Context, service string, body io.Reader, v2 bool, phase string) (io.ReadCloser, error) {
 	reqURL := fmt.Sprintf("%s/%s", c.EndpointURL.String(), service)
 	ctx = withHTTPTrace(ctx, "POST "+service)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, body)
 	if err != nil {
 		return nil, fmt.Errorf("create RPC request: %w", err)
+	}
+	if spooled, ok := body.(*SpooledBody); ok {
+		req.ContentLength = spooled.size
+		path := spooled.path
+		req.GetBody = func() (io.ReadCloser, error) {
+			return os.Open(path)
+		}
 	}
 	req.Header.Set("Content-Type", fmt.Sprintf("application/x-%s-request", service))
 	req.Header.Set("Accept", fmt.Sprintf("application/x-%s-result", service))
@@ -407,6 +425,61 @@ func (c *HTTPConn) PostRPCStreamBody(ctx context.Context, service string, body i
 		return nil, err
 	}
 	return res.Body, nil
+}
+
+// SpooledBody is a temp-file-backed request body with a known length.
+// PostRPCStreamBody type-asserts on it and sets req.ContentLength /
+// req.GetBody so the request body goes out in one continuous burst
+// (no mid-stream idle gap) and is replayable on transient connection
+// failures.
+//
+// Used by the materialized push path, where the full payload has to be
+// produced locally before any bytes can flow — go-git's encoder runs
+// delta selection synchronously before writing the pack, which on big
+// repos stalls the request body for tens of seconds. CDN edges like
+// Cloudflare's enforce an idle-write timeout on request bodies and
+// close the connection on a stall that long; spooling first eliminates
+// the gap entirely. The closure walk already requires a local store,
+// so the temp file doesn't change the strategy's fundamental shape.
+//
+// Relay paths intentionally don't use this — source pack bytes flow
+// steadily from the upstream upload-pack response, so there's no stall
+// to engineer around. Keeping relay streaming is the whole point of
+// the relay shape.
+type SpooledBody struct {
+	io.ReadCloser
+	path string
+	size int64
+}
+
+// NewSpooledBody creates a temp file, writes write(f) into it, rewinds
+// it, and returns a SpooledBody plus a cleanup that removes the temp
+// file. The cleanup is always non-nil; call it (typically via defer)
+// regardless of error.
+func NewSpooledBody(write func(io.Writer) error) (*SpooledBody, func(), error) {
+	f, err := os.CreateTemp("", "git-sync-rpc-*")
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("create temp file: %w", err)
+	}
+	path := f.Name()
+	cleanup := func() {
+		_ = f.Close()
+		_ = os.Remove(path)
+	}
+	if err := write(f); err != nil {
+		cleanup()
+		return nil, func() {}, err
+	}
+	size, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		cleanup()
+		return nil, func() {}, fmt.Errorf("get spooled body size: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		cleanup()
+		return nil, func() {}, fmt.Errorf("rewind spooled body: %w", err)
+	}
+	return &SpooledBody{ReadCloser: f, path: path, size: size}, cleanup, nil
 }
 
 // ApplyAuth applies the given auth method to an HTTP request. Errors from
