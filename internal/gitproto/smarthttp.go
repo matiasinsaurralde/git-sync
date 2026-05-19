@@ -8,7 +8,9 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/go-git/go-git/v6/plumbing/protocol/capability"
@@ -62,6 +64,71 @@ func httpError(res *http.Response) error {
 // StatsPhaseHeader is the HTTP header used to annotate requests with the
 // current git-sync stats phase for round-trip tracking.
 const StatsPhaseHeader = "X-Git-Sync-Stats-Phase"
+
+// HTTPTraceEnv enables verbose httptrace logging to stderr when set to any
+// non-empty value other than "0" or "false". Diagnoses connection-pool
+// behavior against hosts that close idle keep-alive connections more
+// aggressively than Go's transport assumes (CDN edges, some hosted git
+// providers) — a stale pooled connection surfaces as "use of closed network
+// connection" on the next POST. Off by default; zero overhead unless set.
+const HTTPTraceEnv = "GITSYNC_HTTP_TRACE"
+
+func httpTraceEnabled() bool {
+	v := os.Getenv(HTTPTraceEnv)
+	if v == "" {
+		return false
+	}
+	switch strings.ToLower(v) {
+	case "0", "false", "no", "off":
+		return false
+	}
+	return true
+}
+
+// withHTTPTrace returns ctx with a ClientTrace that logs connection lifecycle
+// events for one request to stderr. label is prepended to every line so
+// concurrent or interleaved requests stay readable. Returns ctx unchanged
+// when GITSYNC_HTTP_TRACE is not enabled.
+func withHTTPTrace(ctx context.Context, label string) context.Context {
+	if !httpTraceEnabled() {
+		return ctx
+	}
+	trace := &httptrace.ClientTrace{
+		GetConn: func(hostPort string) {
+			fmt.Fprintf(os.Stderr, "[httptrace] %s GetConn %s\n", label, hostPort)
+		},
+		GotConn: func(info httptrace.GotConnInfo) {
+			fmt.Fprintf(os.Stderr,
+				"[httptrace] %s GotConn reused=%v wasIdle=%v idle=%s local=%s remote=%s\n",
+				label, info.Reused, info.WasIdle, info.IdleTime,
+				info.Conn.LocalAddr(), info.Conn.RemoteAddr())
+		},
+		PutIdleConn: func(err error) {
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[httptrace] %s PutIdleConn err=%v\n", label, err)
+			} else {
+				fmt.Fprintf(os.Stderr, "[httptrace] %s PutIdleConn ok\n", label)
+			}
+		},
+		ConnectStart: func(network, addr string) {
+			fmt.Fprintf(os.Stderr, "[httptrace] %s ConnectStart %s %s\n", label, network, addr)
+		},
+		ConnectDone: func(network, addr string, err error) {
+			fmt.Fprintf(os.Stderr, "[httptrace] %s ConnectDone %s %s err=%v\n", label, network, addr, err)
+		},
+		TLSHandshakeStart: func() {
+			fmt.Fprintf(os.Stderr, "[httptrace] %s TLSHandshakeStart\n", label)
+		},
+		TLSHandshakeDone: func(state tls.ConnectionState, err error) {
+			fmt.Fprintf(os.Stderr, "[httptrace] %s TLSHandshakeDone resumed=%v err=%v\n",
+				label, state.DidResume, err)
+		},
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			fmt.Fprintf(os.Stderr, "[httptrace] %s WroteRequest err=%v\n", label, info.Err)
+		},
+	}
+	return httptrace.WithClientTrace(ctx, trace)
+}
 
 // AuthMethod authorizes outbound HTTP requests for a remote. It is satisfied
 // by *transporthttp.BasicAuth and *transporthttp.TokenAuth, whose Authorizer
@@ -162,6 +229,7 @@ func RequestInfoRefs(ctx context.Context, conn Conn, service string, gitProtocol
 // RequestInfoRefs fetches /info/refs for the given service.
 func (c *HTTPConn) RequestInfoRefs(ctx context.Context, service string, gitProtocol string) ([]byte, error) {
 	reqURL := fmt.Sprintf("%s/info/refs?service=%s", c.EndpointURL.String(), service)
+	ctx = withHTTPTrace(ctx, "GET "+service+"/info/refs")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create info-refs request: %w", err)
@@ -253,6 +321,7 @@ func PostRPCStreamBody(ctx context.Context, conn Conn, service string, body io.R
 // Caller must close the returned ReadCloser.
 func (c *HTTPConn) PostRPCStreamBody(ctx context.Context, service string, body io.Reader, v2 bool, phase string) (io.ReadCloser, error) {
 	reqURL := fmt.Sprintf("%s/%s", c.EndpointURL.String(), service)
+	ctx = withHTTPTrace(ctx, "POST "+service)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, body)
 	if err != nil {
 		return nil, fmt.Errorf("create RPC request: %w", err)
