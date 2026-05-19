@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/format/packfile"
@@ -255,11 +257,18 @@ func PushObjects(
 	}
 
 	useRefDeltas := !adv.Capabilities.Supports(capability.OFSDelta)
+	encodeProgress := progressSink(verbose, "target: ", conn.ProgressWriter())
 	spooled, cleanup, err := NewSpooledBody(func(w io.Writer) error {
-		if err := req.Encode(w); err != nil {
+		cw := &countingWriter{w: w}
+		if err := req.Encode(cw); err != nil {
 			return fmt.Errorf("encode update-request: %w", err)
 		}
-		enc := packfile.NewEncoder(w, store, useRefDeltas)
+		// Use the post-header byte count as the baseline so "pack size"
+		// numbers in the progress line reflect just the pack, not the
+		// preceding update-request bytes.
+		stopProgress := startPackEncodeProgress(cw, cw.Count(), encodeProgress)
+		defer stopProgress()
+		enc := packfile.NewEncoder(cw, store, useRefDeltas)
 		if _, err := enc.Encode(hashes, 10); err != nil {
 			return fmt.Errorf("encode packfile: %w", err)
 		}
@@ -270,6 +279,95 @@ func PushObjects(
 	}
 	defer cleanup()
 	return postReceivePack(ctx, conn, req, spooled, verbose, onRejection)
+}
+
+// countingWriter wraps an io.Writer and tracks total bytes written.
+// Reads of the count are safe to call concurrently with Write.
+type countingWriter struct {
+	w io.Writer
+	n atomic.Int64
+}
+
+func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.n.Add(int64(n))
+	return n, err
+}
+
+func (cw *countingWriter) Count() int64 { return cw.n.Load() }
+
+// startPackEncodeProgress emits in-place progress updates while
+// materialized push is spooling its body. The output distinguishes
+// two phases of go-git's encoder:
+//
+//   - "selecting deltas, elapsed X" while the delta selector walks
+//     the object graph (no bytes flow during this phase)
+//   - "encoding pack: N MB, elapsed X" once the selector finishes and
+//     the encoder starts writing pack bytes
+//
+// Phase detection uses the 12-byte pack header as the boundary: any
+// post-baseline write beyond that means delta selection is done.
+// baseline is the byte count at the start of encoding (typically the
+// size of the update-request bytes already written to the same writer).
+//
+// Returns a stop function that finalizes the line with a permanent
+// "encoded pack" summary; safe to call exactly once, typically via
+// defer. When dest is nil (non-verbose mode) returns a no-op stop, so
+// callers don't need to special-case verbosity.
+func startPackEncodeProgress(cw *countingWriter, baseline int64, dest io.Writer) func() {
+	if dest == nil {
+		return func() {}
+	}
+	const packHeaderSize = 12
+	start := time.Now()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				packBytes := cw.Count() - baseline
+				elapsed := time.Since(start).Round(time.Second)
+				if packBytes <= packHeaderSize {
+					fmt.Fprintf(dest, "selecting deltas, elapsed %s\r", elapsed)
+				} else {
+					fmt.Fprintf(dest, "encoding pack: %s, elapsed %s\r",
+						humanizeBytes(packBytes), elapsed)
+				}
+			}
+		}
+	}()
+	return func() {
+		ticker.Stop()
+		close(stop)
+		<-done
+		fmt.Fprintf(dest, "encoded pack: %s in %s\n",
+			humanizeBytes(cw.Count()-baseline), time.Since(start).Round(time.Second))
+	}
+}
+
+// humanizeBytes renders n in IEC units with one decimal place for KB+
+// (e.g. "47.3 MB"). Anything below 1 KB is shown as raw bytes.
+func humanizeBytes(n int64) string {
+	const (
+		kb = 1024
+		mb = kb * 1024
+		gb = mb * 1024
+	)
+	switch {
+	case n < kb:
+		return fmt.Sprintf("%d B", n)
+	case n < mb:
+		return fmt.Sprintf("%.1f KB", float64(n)/float64(kb))
+	case n < gb:
+		return fmt.Sprintf("%.1f MB", float64(n)/float64(mb))
+	default:
+		return fmt.Sprintf("%.1f GB", float64(n)/float64(gb))
+	}
 }
 
 // PushPack pushes a pack stream (relay) to the target.
