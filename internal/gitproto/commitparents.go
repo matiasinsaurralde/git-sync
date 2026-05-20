@@ -266,35 +266,58 @@ func (c *deltaCache) get(hash plumbing.Hash) (*deltaCacheEntry, bool) {
 
 // --- Commit-header parsing ---------------------------------------------------
 
-// parseCommitParents walks the header lines of a commit object and
-// returns the hashes referenced by "parent <hash>\n" lines. Stops at
-// the first empty line (end of headers) or at "author " (parents
-// always appear before author in well-formed commits).
+// parseCommitParents extracts parent hashes from the canonical
+// position of a commit object: immediately after the single "tree"
+// header, in an uninterrupted run, before any other header. Anything
+// outside that run — "parent" lines that appear before "tree", after
+// the first non-parent header, or in malformed shape — is ignored.
+//
+// This mirrors git's own parser: a malformed commit can claim extra
+// "parent" lines outside the canonical position, but git treats only
+// the canonical run as real parents. Matching git here keeps our
+// reachability computation consistent with what a canonical reader
+// will see in the same bytes.
+//
+// Returns nil if the first header isn't "tree <40-hex>", or if a
+// parent line is malformed (wrong length / non-hex hash). In both
+// cases the planner sees an empty parent set and stops walking
+// rather than guessing.
 func parseCommitParents(content []byte) []plumbing.Hash {
-	const prefix = "parent "
-	var parents []plumbing.Hash
-	rest := content
-	for len(rest) > 0 {
-		nl := bytes.IndexByte(rest, '\n')
-		var line []byte
-		if nl < 0 {
-			line = rest
-			rest = nil
-		} else {
-			line = rest[:nl]
-			rest = rest[nl+1:]
-		}
-		if len(line) == 0 {
-			return parents
-		}
-		switch {
-		case bytes.HasPrefix(line, []byte(prefix)):
-			if len(line) >= len(prefix)+40 {
-				parents = append(parents, plumbing.NewHash(string(line[len(prefix):len(prefix)+40])))
-			}
-		case bytes.HasPrefix(line, []byte("author ")):
-			return parents
-		}
+	const (
+		treePrefix   = "tree "
+		parentPrefix = "parent "
+		parentLen    = len(parentPrefix) + 40
+	)
+
+	line, rest := nextLine(content)
+	if !bytes.HasPrefix(line, []byte(treePrefix)) {
+		return nil
 	}
-	return parents
+
+	var parents []plumbing.Hash
+	for {
+		line, rest = nextLine(rest)
+		if !bytes.HasPrefix(line, []byte(parentPrefix)) {
+			return parents
+		}
+		if len(line) != parentLen {
+			return parents
+		}
+		h := plumbing.NewHash(string(line[len(parentPrefix):]))
+		if h.IsZero() {
+			return parents
+		}
+		parents = append(parents, h)
+	}
+}
+
+// nextLine splits off the first '\n'-terminated line from content,
+// returning the line (without the newline) and the remainder. If
+// content has no newline, returns it whole with a nil remainder.
+func nextLine(content []byte) (line, rest []byte) {
+	nl := bytes.IndexByte(content, '\n')
+	if nl < 0 {
+		return content, nil
+	}
+	return content[:nl], content[nl+1:]
 }

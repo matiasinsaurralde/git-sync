@@ -3,6 +3,8 @@ package gitproto
 import (
 	"bytes"
 	"io"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -156,6 +158,94 @@ func TestExtractCommitParents_WithDeltas(t *testing.T) {
 type readOnlyReader struct{ r io.Reader }
 
 func (r readOnlyReader) Read(p []byte) (int, error) { return r.r.Read(p) }
+
+// TestParseCommitParents_CanonicalPositionOnly locks in that we
+// extract parents only from the canonical position (immediately
+// after "tree", in an uninterrupted run). A malformed commit that
+// puts "parent" lines elsewhere should not influence the result —
+// this matches git's own parser and prevents reachability divergence
+// between us and any canonical reader of the same bytes.
+func TestParseCommitParents_CanonicalPositionOnly(t *testing.T) {
+	t.Parallel()
+	var (
+		tree = strings.Repeat("a", 40)
+		h1   = strings.Repeat("1", 40)
+		h2   = strings.Repeat("2", 40)
+		h3   = strings.Repeat("3", 40)
+	)
+
+	cases := []struct {
+		name string
+		body string
+		want []plumbing.Hash
+	}{
+		{
+			name: "root commit (no parents)",
+			body: "tree " + tree + "\nauthor X <x@e> 0 +0000\ncommitter X <x@e> 0 +0000\n\nmsg\n",
+			want: nil,
+		},
+		{
+			name: "single parent",
+			body: "tree " + tree + "\nparent " + h1 + "\nauthor X <x@e> 0 +0000\n\nmsg\n",
+			want: []plumbing.Hash{plumbing.NewHash(h1)},
+		},
+		{
+			name: "merge: two parents",
+			body: "tree " + tree + "\nparent " + h1 + "\nparent " + h2 + "\nauthor X <x@e> 0 +0000\n\nmsg\n",
+			want: []plumbing.Hash{plumbing.NewHash(h1), plumbing.NewHash(h2)},
+		},
+		{
+			name: "parent before tree is ignored (object malformed: tree must be first)",
+			body: "parent " + h1 + "\ntree " + tree + "\nparent " + h2 + "\nauthor X <x@e> 0 +0000\n\nmsg\n",
+			want: nil,
+		},
+		{
+			name: "missing tree returns nil",
+			body: "parent " + h1 + "\nauthor X <x@e> 0 +0000\n\nmsg\n",
+			want: nil,
+		},
+		{
+			name: "parent after author is ignored",
+			body: "tree " + tree + "\nparent " + h1 + "\nauthor X <x@e> 0 +0000\nparent " + h2 + "\n\nmsg\n",
+			want: []plumbing.Hash{plumbing.NewHash(h1)},
+		},
+		{
+			name: "parent run interrupted by another header is truncated",
+			body: "tree " + tree + "\nparent " + h1 + "\nencoding UTF-8\nparent " + h2 + "\nauthor X <x@e> 0 +0000\n\nmsg\n",
+			want: []plumbing.Hash{plumbing.NewHash(h1)},
+		},
+		{
+			name: "malformed parent line (too short) stops the run",
+			body: "tree " + tree + "\nparent " + h1 + "\nparent short\nparent " + h2 + "\nauthor X <x@e> 0 +0000\n\nmsg\n",
+			want: []plumbing.Hash{plumbing.NewHash(h1)},
+		},
+		{
+			name: "non-hex parent hash stops the run",
+			body: "tree " + tree + "\nparent " + h1 + "\nparent " + strings.Repeat("g", 40) + "\nparent " + h2 + "\nauthor X <x@e> 0 +0000\n\nmsg\n",
+			want: []plumbing.Hash{plumbing.NewHash(h1)},
+		},
+		{
+			name: "three parents in canonical run",
+			body: "tree " + tree + "\nparent " + h1 + "\nparent " + h2 + "\nparent " + h3 + "\nauthor X <x@e> 0 +0000\n\nmsg\n",
+			want: []plumbing.Hash{plumbing.NewHash(h1), plumbing.NewHash(h2), plumbing.NewHash(h3)},
+		},
+		{
+			name: "empty body returns nil",
+			body: "",
+			want: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := parseCommitParents([]byte(tc.body))
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("parseCommitParents:\n got=%v\nwant=%v", got, tc.want)
+			}
+		})
+	}
+}
 
 func TestExtractCommitParents_NonSeekableSpillsToDisk(t *testing.T) {
 	t.Parallel()
