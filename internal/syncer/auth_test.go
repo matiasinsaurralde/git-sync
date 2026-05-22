@@ -26,7 +26,7 @@ func TestResolveAuthMethodPrefersExplicitToken(t *testing.T) {
 
 	originalCred := auth.GitCredentialCommand
 	t.Cleanup(func() { auth.GitCredentialCommand = originalCred })
-	auth.GitCredentialCommand = func(_ context.Context, op, input string) ([]byte, error) {
+	auth.GitCredentialCommand = func(_ context.Context, op auth.CredentialOp, input string) ([]byte, error) {
 		t.Fatalf("unexpected git credential %s call with input %q", op, input)
 		return nil, nil
 	}
@@ -120,7 +120,7 @@ func TestResolveAuthMethodUsesEntireDBStoredToken(t *testing.T) {
 
 	originalCred := auth.GitCredentialCommand
 	t.Cleanup(func() { auth.GitCredentialCommand = originalCred })
-	auth.GitCredentialCommand = func(_ context.Context, op, input string) ([]byte, error) {
+	auth.GitCredentialCommand = func(_ context.Context, op auth.CredentialOp, input string) ([]byte, error) {
 		t.Fatalf("unexpected git credential %s call with input %q", op, input)
 		return nil, nil
 	}

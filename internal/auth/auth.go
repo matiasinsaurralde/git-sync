@@ -44,12 +44,6 @@ func Resolve(raw Endpoint, ep *url.URL) (Method, error) {
 	} else if ok {
 		return &transporthttp.BasicAuth{Username: username, Password: password}, nil
 	}
-	// Note: we deliberately do not consult the git credential helper here.
-	// Doing so eagerly would leak stored credentials to public repos that
-	// don't require auth, and previously caused interactive prompts when
-	// no helper had credentials (issue #63). The credential helper is now
-	// consulted on demand when an HTTP request returns 401 — see
-	// GitCredentialHelper, wired up by the HTTP connection layer.
 	return nil, nil //nolint:nilnil // nil signals no auth method found at this stage
 }
 
@@ -67,58 +61,54 @@ func explicitAuth(raw Endpoint) Method {
 	return nil
 }
 
-// newGitCredentialCmd builds the `git credential <op>` invocation used by
-// GitCredentialCommand. Extracted so tests can inspect the command's
-// environment without exec'ing git.
-func newGitCredentialCmd(ctx context.Context, op, input string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "git", "credential", op)
+// CredentialOp identifies a `git credential` subcommand.
+type CredentialOp string
+
+const (
+	CredentialOpFill    CredentialOp = "fill"
+	CredentialOpApprove CredentialOp = "approve"
+	CredentialOpReject  CredentialOp = "reject"
+)
+
+// newGitCredentialCmd builds the `git credential <op>` invocation. Extracted
+// so tests can inspect the command's environment without exec'ing git.
+func newGitCredentialCmd(ctx context.Context, op CredentialOp, input string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "git", "credential", string(op))
 	cmd.Stdin = strings.NewReader(input)
-	// Disable git's interactive terminal prompt fallback. When no credential
-	// helper has credentials for the host (e.g. a public repo on a server
-	// the user has never authenticated against), git would otherwise drop
-	// to an interactive username/password prompt on /dev/tty. git-sync is a
-	// non-interactive tool — failing here lets us cleanly surface a 401
-	// rather than block waiting for input. See issue #63.
+	// Suppress git's interactive username/password fallback. Without this,
+	// a host with no configured helper drops to a /dev/tty prompt and turns
+	// git-sync into an interactive command (issue #63).
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	return cmd
 }
 
 // GitCredentialCommand invokes `git credential <op>` with the given input
-// (in the git-credential text format). op is one of "fill", "approve", or
-// "reject". Replaceable for testing.
-var GitCredentialCommand = func(ctx context.Context, op, input string) ([]byte, error) {
+// (git-credential text format). Replaceable for testing.
+var GitCredentialCommand = func(ctx context.Context, op CredentialOp, input string) ([]byte, error) {
 	return newGitCredentialCmd(ctx, op, input).Output()
 }
 
 // GitCredentialHelper bridges Git's credential helper protocol to HTTP auth.
-// It looks up credentials on demand (typically in response to a 401) and
-// signals back to the helper whether the credentials worked.
-//
-// Implementations are best-effort: a missing or misbehaving helper must not
-// fail the surrounding sync, only deny credentials. Errors from approve/reject
-// are silently swallowed since those steps are advisory.
+// Best-effort: a missing or misbehaving helper denies credentials rather
+// than failing the surrounding sync.
 type GitCredentialHelper struct{}
 
 // Lookup queries the git credential helper for credentials for ep. Returns
-// ok=false if no credentials are available (so the caller can surface a
-// clean 401 rather than block).
+// ok=false if no credentials are available so the caller can surface a
+// clean 401 rather than block.
 //
 //nolint:unparam // err is always nil today but kept for the CredentialHelper interface.
 func (GitCredentialHelper) Lookup(ctx context.Context, ep *url.URL) (username, password string, ok bool, err error) {
 	if !isHTTPEndpoint(ep) {
-		// git's credential helper protocol only knows about HTTP.
 		return "", "", false, nil
 	}
 	input := credentialInput(ep, "", "")
 	if input == "" {
 		return "", "", false, nil
 	}
-	output, helperErr := GitCredentialCommand(ctx, "fill", input)
+	output, helperErr := GitCredentialCommand(ctx, CredentialOpFill, input)
 	if helperErr != nil {
-		// Helper exited non-zero — typically means "no credentials found"
-		// or "terminal prompts disabled" (when no helper has creds). Treat
-		// both as "no credentials available" so the original 401 surfaces.
-		return "", "", false, nil //nolint:nilerr // intentional: swallow helper failure as "no credentials"
+		return "", "", false, nil //nolint:nilerr // helper failure means "no credentials available"
 	}
 	values := parseCredentialOutput(output)
 	password = values["password"]
@@ -136,29 +126,26 @@ func (GitCredentialHelper) Lookup(ctx context.Context, ep *url.URL) (username, p
 	return username, password, true, nil
 }
 
-// isHTTPEndpoint reports whether ep is a non-nil HTTP or HTTPS endpoint.
+// Approve tells the helper the credentials worked.
+func (h GitCredentialHelper) Approve(ctx context.Context, ep *url.URL, username, password string) {
+	h.signal(ctx, CredentialOpApprove, ep, username, password)
+}
+
+// Reject tells the helper the credentials failed.
+func (h GitCredentialHelper) Reject(ctx context.Context, ep *url.URL, username, password string) {
+	h.signal(ctx, CredentialOpReject, ep, username, password)
+}
+
+func (GitCredentialHelper) signal(ctx context.Context, op CredentialOp, ep *url.URL, username, password string) {
+	input := credentialInput(ep, username, password)
+	if input == "" {
+		return
+	}
+	_, _ = GitCredentialCommand(ctx, op, input) //nolint:errcheck // advisory signal; helper failures swallowed
+}
+
 func isHTTPEndpoint(ep *url.URL) bool {
 	return ep != nil && (ep.Scheme == "http" || ep.Scheme == "https")
-}
-
-// Approve tells the helper the credentials worked, so it can persist them.
-// Best-effort: helper failures are swallowed.
-func (GitCredentialHelper) Approve(ctx context.Context, ep *url.URL, username, password string) {
-	input := credentialInput(ep, username, password)
-	if input == "" {
-		return
-	}
-	_, _ = GitCredentialCommand(ctx, "approve", input) //nolint:errcheck // best-effort signal
-}
-
-// Reject tells the helper the credentials failed, so it can forget them.
-// Best-effort: helper failures are swallowed.
-func (GitCredentialHelper) Reject(ctx context.Context, ep *url.URL, username, password string) {
-	input := credentialInput(ep, username, password)
-	if input == "" {
-		return
-	}
-	_, _ = GitCredentialCommand(ctx, "reject", input) //nolint:errcheck // best-effort signal
 }
 
 // credentialInput builds a git-credential format request body for the given

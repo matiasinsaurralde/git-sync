@@ -1704,7 +1704,7 @@ func TestRun_IntegrationUsesGitCredentialHelperFallback(t *testing.T) {
 	t.Cleanup(func() {
 		auth.GitCredentialCommand = originalCred
 	})
-	auth.GitCredentialCommand = func(_ context.Context, op, input string) ([]byte, error) {
+	auth.GitCredentialCommand = func(_ context.Context, op auth.CredentialOp, input string) ([]byte, error) {
 		if !strings.Contains(input, "protocol=http\n") {
 			t.Fatalf("expected protocol in credential input, got %q", input)
 		}
@@ -1715,10 +1715,9 @@ func TestRun_IntegrationUsesGitCredentialHelperFallback(t *testing.T) {
 			t.Fatalf("expected repo path in credential input, got %q", input)
 		}
 		switch op {
-		case "fill":
+		case auth.CredentialOpFill:
 			return []byte("username=" + username + "\npassword=" + password + "\n\n"), nil
-		case "approve", "reject":
-			// Best-effort signaling — accept and return empty.
+		case auth.CredentialOpApprove, auth.CredentialOpReject:
 			return nil, nil
 		default:
 			t.Fatalf("unexpected git credential op %q", op)
