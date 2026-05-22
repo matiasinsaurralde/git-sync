@@ -232,7 +232,7 @@ func PushObjects(
 
 	stopSelect := startSelectionProgress(progressDest)
 	objects, err := packfile.NewDeltaSelector(store).ObjectsToPack(hashes, 10)
-	stopSelect(len(objects))
+	stopSelect(len(objects), err)
 	if err != nil {
 		return fmt.Errorf("select objects to pack: %w", err)
 	}
@@ -286,7 +286,10 @@ type countingWriter struct {
 func (cw *countingWriter) Write(p []byte) (int, error) {
 	n, err := cw.w.Write(p)
 	cw.n.Add(int64(n))
-	return n, err
+	if err != nil {
+		return n, fmt.Errorf("counting writer: %w", err)
+	}
+	return n, nil
 }
 
 func (cw *countingWriter) Count() int64 { return cw.n.Load() }
@@ -294,16 +297,18 @@ func (cw *countingWriter) Count() int64 { return cw.n.Load() }
 // startSelectionProgress emits in-place "selecting deltas, elapsed X"
 // updates every 500ms during the synchronous delta-selection phase of
 // PushObjects. The returned stop function takes the number of selected
-// objects and finalizes the line with a permanent "selected N objects
-// in Y" summary. When dest is nil (non-verbose mode) returns a no-op
-// stop, so callers don't need to special-case verbosity.
+// objects and the selection error (nil on success); on success it
+// finalizes the line with a permanent "selected N objects in Y"
+// summary, on error it just stops the ticker without claiming success.
+// When dest is nil (non-verbose mode) returns a no-op stop, so
+// callers don't need to special-case verbosity.
 //
 // Selection has no observable byte progress — go-git's DeltaSelector
 // is opaque to the caller — so elapsed time is the only signal we can
 // surface to keep long selections from looking like a hang.
-func startSelectionProgress(dest io.Writer) func(objectCount int) {
+func startSelectionProgress(dest io.Writer) func(objectCount int, err error) {
 	if dest == nil {
-		return func(int) {}
+		return func(int, error) {}
 	}
 	start := time.Now()
 	ticker := time.NewTicker(500 * time.Millisecond)
@@ -321,10 +326,13 @@ func startSelectionProgress(dest io.Writer) func(objectCount int) {
 			}
 		}
 	}()
-	return func(objectCount int) {
+	return func(objectCount int, err error) {
 		ticker.Stop()
 		close(stop)
 		<-done
+		if err != nil {
+			return
+		}
 		fmt.Fprintf(dest, "selected %d objects in %s\n",
 			objectCount, time.Since(start).Round(time.Second))
 	}

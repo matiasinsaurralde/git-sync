@@ -349,8 +349,15 @@ func truncateHost(host string, width int) string {
 // line in two calls — first the prefix ("source: "), then the content
 // with terminator — and would otherwise produce two separate notify
 // frames split mid-line. Use as a pointer (the buffer is stateful).
+//
+// mu guards buf and serializes notify/setTransient calls against
+// concurrent writers. The HTTP push path is the case that motivated
+// this: a materialized-push encode goroutine and the receive-pack
+// response demuxer can both emit progress through the same
+// conn.ProgressWriter() during overlapping windows.
 type sessionStderr struct {
 	s   *syncSession
+	mu  sync.Mutex
 	buf strings.Builder
 }
 
@@ -362,6 +369,8 @@ func (w *sessionStderr) Write(b []byte) (int, error) {
 		}
 		return n, nil
 	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	s := string(b)
 	for s != "" {
 		i := strings.IndexAny(s, "\r\n")
