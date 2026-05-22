@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"entire.io/entire/git-sync/internal/auth"
 	"entire.io/entire/git-sync/internal/syncertest"
 	"entire.io/entire/git-sync/unstable"
 	billy "github.com/go-git/go-billy/v6"
@@ -28,6 +30,21 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage/memory"
 )
+
+// TestMain isolates the package's tests from the developer's local
+// credential helper. Without this, `git credential fill` could find
+// stored credentials for 127.0.0.1 (e.g. cached from an earlier test
+// run) and turn EnsureAuthForService's would-be no-op into a real
+// auth-probe POST, throwing off receive-pack POST counts.
+//
+// Tests that need to exercise helper behaviour explicitly should
+// restore auth.GitCredentialCommand in their own setup.
+func TestMain(m *testing.M) {
+	auth.GitCredentialCommand = func(_ context.Context, _ auth.CredentialOp, _ string) ([]byte, error) {
+		return nil, errors.New("no helper configured (test default)")
+	}
+	os.Exit(m.Run())
+}
 
 const testBranch = "master"
 const modeReplicate = "replicate"

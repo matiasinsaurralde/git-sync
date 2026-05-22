@@ -901,8 +901,31 @@ func TestEnsureAuthForService_AnonymousServiceLeavesAuthNil(t *testing.T) {
 	if conn.Auth != nil {
 		t.Error("expected conn.Auth to remain nil when probe gets non-401")
 	}
-	if got := helper.count("lookup"); got != 0 {
-		t.Errorf("expected 0 helper lookups when probe didn't 401, got %d", got)
+	if got := helper.count("approve"); got != 0 {
+		t.Errorf("must not Approve when probe didn't 401, got %d", got)
+	}
+}
+
+// TestEnsureAuthForService_SkipsProbeWhenHelperHasNoCredentials avoids a
+// wasted no-op POST when there are no credentials to attach anyway — the
+// common shape for anonymous syncs and for syncs running in test/CI
+// environments with no credential helper configured.
+func TestEnsureAuthForService_SkipsProbeWhenHelperHasNoCredentials(t *testing.T) {
+	helper := &fakeCredentialHelper{ok: false}
+	called := false
+	conn := newTestConn(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		called = true
+		return newUnauthorizedResponse(req), nil
+	}))
+	conn.CredentialHelper = helper
+
+	conn.EnsureAuthForService(context.Background(), "git-receive-pack")
+
+	if called {
+		t.Error("expected no probe when the helper has no credentials")
+	}
+	if conn.Auth != nil {
+		t.Error("expected conn.Auth to remain nil")
 	}
 }
 
@@ -978,6 +1001,79 @@ func TestEnsureAuthForService_RealPostRejectsTentativeCreds(t *testing.T) {
 	}
 	if conn.Auth != nil {
 		t.Error("expected conn.Auth to be cleared after rejecting bad creds")
+	}
+}
+
+// TestEnsureAuthForService_ProbesWithPOSTAndFlushPacketBody verifies the
+// probe uses the same HTTP method as the real operation (POST), with a
+// minimal "0000" flush packet body — a valid no-op receive-pack push by
+// the smart-HTTP spec. Probing with POST is essential: servers that
+// gate only the POST handler (not GET) would otherwise slip past us.
+func TestEnsureAuthForService_ProbesWithPOSTAndFlushPacketBody(t *testing.T) {
+	helper := &fakeCredentialHelper{user: "alice", pass: "s3cret", ok: true}
+	var probeMethod string
+	var probeBody []byte
+	conn := newTestConn(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		probeMethod = req.Method
+		if req.Body != nil {
+			b, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("read probe body: %v", err)
+			}
+			probeBody = b
+		}
+		return newUnauthorizedResponse(req), nil
+	}))
+	conn.CredentialHelper = helper
+
+	conn.EnsureAuthForService(context.Background(), "git-receive-pack")
+
+	if probeMethod != http.MethodPost {
+		t.Errorf("expected probe method POST, got %q", probeMethod)
+	}
+	if string(probeBody) != "0000" {
+		t.Errorf("expected probe body to be the flush packet '0000', got %q", probeBody)
+	}
+}
+
+// TestEnsureAuthForService_DetectsAuthGatedPostEvenWhenGetIsAnonymous:
+// the gap a GET-based probe would miss — server returns 404 to GET
+// (the receive-pack endpoint isn't a GET resource) but 401 to POST.
+// A POST probe correctly detects the auth requirement.
+func TestEnsureAuthForService_DetectsAuthGatedPostEvenWhenGetIsAnonymous(t *testing.T) {
+	helper := &fakeCredentialHelper{user: "alice", pass: "s3cret", ok: true}
+	var methods []string
+	conn := newTestConn(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		methods = append(methods, req.Method)
+		if req.Method == http.MethodGet {
+			return &http.Response{
+				StatusCode: http.StatusNotFound, Request: req, Header: make(http.Header),
+				Body: io.NopCloser(strings.NewReader("")),
+			}, nil
+		}
+		// POST: server requires auth.
+		if req.Header.Get("Authorization") == "" {
+			return newUnauthorizedResponse(req), nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK, Request: req, Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader("")),
+		}, nil
+	}))
+	conn.CredentialHelper = helper
+
+	conn.EnsureAuthForService(context.Background(), "git-receive-pack")
+
+	if conn.Auth == nil {
+		t.Fatal("expected probe to detect POST auth requirement and attach helper creds")
+	}
+	if got := helper.count("lookup"); got != 1 {
+		t.Errorf("expected 1 helper lookup, got %d", got)
+	}
+	for _, m := range methods {
+		if m == http.MethodGet {
+			t.Errorf("probe should not use GET — server may serve GET differently than POST")
+		}
 	}
 }
 

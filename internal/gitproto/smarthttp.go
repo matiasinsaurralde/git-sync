@@ -478,29 +478,40 @@ func ApplyAuth(req *http.Request, auth AuthMethod) {
 
 // EnsureAuthForService tentatively attaches helper credentials before a
 // non-rewindable request body is committed. It's a no-op when no helper
-// is configured or Auth is already set.
+// is configured, when Auth is already set, or when the helper has no
+// credentials to offer.
 //
 // Used from push.go (and other streaming-body POST paths) where the body
 // is built from a live upstream stream (e.g. io.MultiReader over a pack
-// reader) and can't be replayed on a mid-stream 401. An anonymous GET
-// /<service> probe asks the server whether it requires auth here. If it
-// 401s, the helper is consulted and the returned credentials are stored
-// in c.Auth tentatively — the next real operation (PostRPCStreamBody or
-// RequestInfoRefs) then Approves them on 2xx or Rejects them on 401/403.
+// reader) and can't be replayed on a mid-stream 401.
 //
-// Approval is deliberately not done from the probe itself: many servers
-// return 405 Method Not Allowed for GET /git-receive-pack without ever
-// checking the Authorization header, so a 405 with credentials attached
-// proves nothing about credential validity. Letting the real operation
-// validate keeps helper state honest.
+// The flow is:
+//  1. Ask the helper if it has credentials for this endpoint. If not,
+//     bail — no point probing for an auth requirement we can't satisfy.
+//     (This also keeps anonymous syncs from doing a wasted no-op POST.)
+//  2. Probe with a POST to /<service> using the smart-HTTP flush packet
+//     "0000" as body — a valid no-op (zero ref updates, zero pack data)
+//     by spec. We probe with POST rather than GET because the auth layer
+//     may only gate the POST handler; a GET probe would slip past on
+//     servers that 404/405 GET while requiring auth on POST.
+//  3. If the probe gets 401, attach the helper credentials tentatively.
+//     The next real operation (PostRPCStreamBody or RequestInfoRefs)
+//     calls resolvePendingHelperCreds, which Approves them on 2xx or
+//     Rejects them on 401/403 — helper state only changes based on the
+//     actual outcome, never on the probe response alone.
 //
-// Servers that allow anonymous GET but only 401 on POST will slip past
-// this probe; for those, callers must pass explicit credentials.
+// If the probe doesn't 401 (200, 404, 405, etc.) we don't attach; the
+// server either accepts anonymous POSTs here or returns ambiguously,
+// and either way attaching unvalidated credentials could leak them.
 func (c *HTTPConn) EnsureAuthForService(ctx context.Context, service string) {
 	if c.Auth != nil || c.CredentialHelper == nil {
 		return
 	}
-	res, err := c.doServiceProbe(ctx, service, nil)
+	user, pass, ok, lookupErr := c.CredentialHelper.Lookup(ctx, c.EndpointURL)
+	if lookupErr != nil || !ok {
+		return
+	}
+	res, err := c.doServiceProbe(ctx, service)
 	if err != nil {
 		return
 	}
@@ -509,10 +520,6 @@ func (c *HTTPConn) EnsureAuthForService(ctx context.Context, service string) {
 		return
 	}
 	challengeURL := challengeURLFor(c.EndpointURL, res)
-	user, pass, ok, lookupErr := c.CredentialHelper.Lookup(ctx, challengeURL)
-	if lookupErr != nil || !ok {
-		return
-	}
 	c.Auth = &transporthttp.BasicAuth{Username: user, Password: pass}
 	c.pendingHelperCreds = &helperCreds{user: user, pass: pass, url: challengeURL}
 }
@@ -539,15 +546,21 @@ func (c *HTTPConn) resolvePendingHelperCreds(ctx context.Context, res *http.Resp
 	// end of life is harmless.
 }
 
-func (c *HTTPConn) doServiceProbe(ctx context.Context, service string, auth AuthMethod) (*http.Response, error) {
+// flushPacket is the smart-HTTP pkt-line "flush" marker. A request body
+// containing only a flush packet is a valid no-op for both upload-pack
+// (no wants/haves) and receive-pack (no ref updates, no pack data).
+var flushPacket = []byte("0000")
+
+func (c *HTTPConn) doServiceProbe(ctx context.Context, service string) (*http.Response, error) {
 	reqURL := fmt.Sprintf("%s/%s", c.EndpointURL.String(), service)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(flushPacket))
 	if err != nil {
 		return nil, fmt.Errorf("create auth-probe request: %w", err)
 	}
+	req.Header.Set("Content-Type", fmt.Sprintf("application/x-%s-request", service))
+	req.Header.Set("Accept", fmt.Sprintf("application/x-%s-result", service))
 	req.Header.Set("User-Agent", capability.DefaultAgent())
 	req.Header.Set(StatsPhaseHeader, service+" auth-probe")
-	ApplyAuth(req, auth)
 	res, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("auth-probe request: %w", err)

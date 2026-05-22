@@ -155,8 +155,7 @@ func sendReceivePack(
 	// The push body is io.MultiReader(header, packData); packData comes
 	// from a live upload-pack pipe and isn't rewindable, so a mid-stream
 	// 401 can't trigger PostRPCStreamBody's normal helper retry. Probe
-	// for auth requirements up front instead — for HTTP conns that have
-	// a CredentialHelper configured but no Auth resolved yet.
+	// for auth requirements with a same-shape POST first.
 	if hc, ok := conn.(*HTTPConn); ok {
 		hc.EnsureAuthForService(ctx, transport.ReceivePackService)
 	}
