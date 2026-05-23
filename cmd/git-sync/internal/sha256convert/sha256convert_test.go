@@ -81,7 +81,7 @@ func TestTranslator(t *testing.T) {
 	}
 	tagHash := writeObject(t, srcRepo.Storer, tag.Encode)
 
-	reachable, err := discoverReachable(srcRepo.Storer, []plumbing.Hash{tagHash})
+	reachable, err := discoverReachable(srcRepo.Storer, []plumbing.Hash{tagHash}, nil)
 	if err != nil {
 		t.Fatalf("discoverReachable: %v", err)
 	}
@@ -95,8 +95,8 @@ func TestTranslator(t *testing.T) {
 	}
 
 	wantCounts := Counts{Blobs: 1, Trees: 1, Commits: 2, Tags: 1}
-	if tr.counts != wantCounts {
-		t.Errorf("counts: got %+v, want %+v", tr.counts, wantCounts)
+	if got := tr.snapshotCounts(); got != wantCounts {
+		t.Errorf("counts: got %+v, want %+v", got, wantCounts)
 	}
 	if tr.signaturesStripped != 2 {
 		t.Errorf("signatures stripped: got %d, want 2 (commit + tag)", tr.signaturesStripped)
@@ -104,11 +104,11 @@ func TestTranslator(t *testing.T) {
 
 	// Idempotency: translating the same hash again must reuse the mapping
 	// without writing more objects or bumping counters.
-	startBlobs := tr.counts.Blobs
+	startBlobs := tr.blobs.Load()
 	if _, err := tr.translate(tagHash); err != nil {
 		t.Fatalf("re-translate tag: %v", err)
 	}
-	if tr.counts.Blobs != startBlobs {
+	if tr.blobs.Load() != startBlobs {
 		t.Errorf("re-translate increased blob count; memoization broken")
 	}
 
@@ -196,7 +196,7 @@ func TestTranslator_RewritesMessageHashes(t *testing.T) {
 	}
 	childSHA1 := writeObject(t, srcRepo.Storer, child.Encode)
 
-	reachable, err := discoverReachable(srcRepo.Storer, []plumbing.Hash{childSHA1})
+	reachable, err := discoverReachable(srcRepo.Storer, []plumbing.Hash{childSHA1}, nil)
 	if err != nil {
 		t.Fatalf("discoverReachable: %v", err)
 	}
@@ -275,7 +275,7 @@ func TestTranslator_RewritesCrossBranchReferences(t *testing.T) {
 
 	// Discovery must see both branches so the reachable set covers cA
 	// before cB is encoded.
-	reachable, err := discoverReachable(srcRepo.Storer, []plumbing.Hash{cB, cA})
+	reachable, err := discoverReachable(srcRepo.Storer, []plumbing.Hash{cB, cA}, nil)
 	if err != nil {
 		t.Fatalf("discoverReachable: %v", err)
 	}
@@ -329,7 +329,7 @@ func TestTranslator_SkipMessageRewrite(t *testing.T) {
 	}
 	childSHA1 := writeObject(t, srcRepo.Storer, child.Encode)
 
-	reachable, err := discoverReachable(srcRepo.Storer, []plumbing.Hash{childSHA1})
+	reachable, err := discoverReachable(srcRepo.Storer, []plumbing.Hash{childSHA1}, nil)
 	if err != nil {
 		t.Fatalf("discoverReachable: %v", err)
 	}
@@ -360,7 +360,7 @@ func TestTranslator_WriteOriginNotes(t *testing.T) {
 	c1 := writeObject(t, srcRepo.Storer, (&object.Commit{Author: sig, Committer: sig, Message: "c1\n", TreeHash: tree}).Encode)
 	c2 := writeObject(t, srcRepo.Storer, (&object.Commit{Author: sig, Committer: sig, Message: "c2\n", TreeHash: tree, ParentHashes: []plumbing.Hash{c1}}).Encode)
 
-	reachable, err := discoverReachable(srcRepo.Storer, []plumbing.Hash{c2})
+	reachable, err := discoverReachable(srcRepo.Storer, []plumbing.Hash{c2}, nil)
 	if err != nil {
 		t.Fatalf("discoverReachable: %v", err)
 	}
@@ -425,7 +425,7 @@ func TestTranslator_WriteMappingFile(t *testing.T) {
 	sig := object.Signature{Name: "Test", Email: "t@example.com", When: time.Unix(1700000000, 0).UTC()}
 	commit := writeObject(t, srcRepo.Storer, (&object.Commit{Author: sig, Committer: sig, Message: "c\n", TreeHash: tree}).Encode)
 
-	reachable, err := discoverReachable(srcRepo.Storer, []plumbing.Hash{commit})
+	reachable, err := discoverReachable(srcRepo.Storer, []plumbing.Hash{commit}, nil)
 	if err != nil {
 		t.Fatalf("discoverReachable: %v", err)
 	}
@@ -531,7 +531,7 @@ func TestTranslator_UnresolvableSubmodule(t *testing.T) {
 		{Name: "sub", Mode: filemode.Submodule, Hash: external},
 	})
 
-	_, err = discoverReachable(srcRepo.Storer, []plumbing.Hash{treeHash})
+	_, err = discoverReachable(srcRepo.Storer, []plumbing.Hash{treeHash}, nil)
 	if err == nil {
 		t.Fatal("expected discoverReachable to fail on unresolvable submodule, got nil")
 	}

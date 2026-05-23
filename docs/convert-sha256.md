@@ -148,6 +148,7 @@ system that holds frozen SHA1 references.
 --no-rewrite-messages              skip inline hash rewrites in messages
 --no-origin-notes                  skip refs/notes/sha1-origin
 --keep-source-objects              leave the temp SHA1 store on disk
+--progress                         live per-phase object counts (TTY only)
 --json                             machine-readable output
 --verbose, -v                      verbose logging
 ```

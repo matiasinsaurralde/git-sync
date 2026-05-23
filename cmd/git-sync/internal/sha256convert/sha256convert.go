@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	git "github.com/go-git/go-git/v6"
@@ -66,6 +67,7 @@ type Request struct {
 
 	ProtocolMode      gitsync.ProtocolMode
 	Verbose           bool
+	Progress          bool
 	KeepSourceObjects bool
 
 	// MappingFile, when non-empty, is a path to which a TSV of every
@@ -227,7 +229,20 @@ func Run(ctx context.Context, req Request) (Result, error) {
 		rootSHA1s = append(rootSHA1s, d.SourceHash)
 	}
 	fmt.Fprintln(out, "discovering reachable objects ...")
-	reachable, err := discoverReachable(srcRepo.Storer, rootSHA1s)
+	progressActive := req.Progress && isTTY(out)
+	var discCounter *atomic.Int64
+	var stopDisc func()
+	if progressActive {
+		c := new(atomic.Int64)
+		discCounter = c
+		stopDisc = startProgressTick(out, func() string {
+			return fmt.Sprintf("  discovered %d objects", c.Load())
+		})
+	}
+	reachable, err := discoverReachable(srcRepo.Storer, rootSHA1s, discCounter)
+	if stopDisc != nil {
+		stopDisc()
+	}
 	if err != nil {
 		return Result{}, fmt.Errorf("discover reachable: %w", err)
 	}
@@ -243,10 +258,23 @@ func Run(ctx context.Context, req Request) (Result, error) {
 		return Result{}, err
 	}
 	fmt.Fprintln(out, "translating objects to sha256 ...")
+	var stopTr func()
+	if progressActive {
+		stopTr = startProgressTick(out, func() string {
+			return fmt.Sprintf("  translated %d blobs, %d trees, %d commits, %d tags",
+				tr.blobs.Load(), tr.trees.Load(), tr.commitsCount.Load(), tr.tags.Load())
+		})
+	}
 	for _, d := range desired {
 		if _, err := tr.translate(d.SourceHash); err != nil {
+			if stopTr != nil {
+				stopTr()
+			}
 			return Result{}, fmt.Errorf("translate %s: %w", d.SourceRef, err)
 		}
+	}
+	if stopTr != nil {
+		stopTr()
 	}
 
 	// Write refs ---------------------------------------------------------
@@ -272,7 +300,7 @@ func Run(ctx context.Context, req Request) (Result, error) {
 		TargetDir:          req.TargetDir,
 		Protocol:           refService.Protocol,
 		RefsConverted:      refsWritten,
-		Counts:             tr.counts,
+		Counts:             tr.snapshotCounts(),
 		SignaturesStripped: tr.signaturesStripped,
 		MessageRewrites:    tr.messageRewrites,
 	}
@@ -419,11 +447,26 @@ type translator struct {
 	// so they know which references to investigate via the mapping
 	// file.
 	ambiguousMessageRefs map[string]struct{}
-	counts               Counts
-	signaturesStripped   int
-	messageRewrites      int
-	rewriteMessages      bool
-	lastNotesCommit      plumbing.Hash
+	// Live counts updated atomically so the --progress ticker goroutine
+	// can sample them without racing against translation. Snapshot into
+	// a Counts struct at the end of the run.
+	blobs              atomic.Int64
+	trees              atomic.Int64
+	commitsCount       atomic.Int64
+	tags               atomic.Int64
+	signaturesStripped int
+	messageRewrites    int
+	rewriteMessages    bool
+	lastNotesCommit    plumbing.Hash
+}
+
+func (t *translator) snapshotCounts() Counts {
+	return Counts{
+		Blobs:   int(t.blobs.Load()),
+		Trees:   int(t.trees.Load()),
+		Commits: int(t.commitsCount.Load()),
+		Tags:    int(t.tags.Load()),
+	}
 }
 
 func newTranslator(src, dst storer.Storer, targetDir string, rewriteMessages bool, reachable map[plumbing.Hash]plumbing.ObjectType) (*translator, error) {
@@ -464,7 +507,10 @@ func newTranslator(src, dst storer.Storer, targetDir string, rewriteMessages boo
 //
 // Message-reference edges are not part of this pass; those are added
 // during translation, where the partial mapping is updated as we go.
-func discoverReachable(src storer.Storer, roots []plumbing.Hash) (map[plumbing.Hash]plumbing.ObjectType, error) {
+//
+// If progress is non-nil, it is incremented once per object visited.
+// The --progress ticker samples this counter from another goroutine.
+func discoverReachable(src storer.Storer, roots []plumbing.Hash, progress *atomic.Int64) (map[plumbing.Hash]plumbing.ObjectType, error) {
 	srcFS, ok := src.(*filesystem.Storage)
 	if !ok {
 		return nil, fmt.Errorf("source storage is not filesystem-backed (%T)", src)
@@ -480,6 +526,9 @@ func discoverReachable(src storer.Storer, roots []plumbing.Hash) (map[plumbing.H
 			return fmt.Errorf("discover %s: %w", sha1, err)
 		}
 		reachable[sha1] = obj.Type()
+		if progress != nil {
+			progress.Add(1)
+		}
 		switch obj.Type() {
 		case plumbing.BlobObject:
 			return nil
@@ -587,7 +636,7 @@ func (t *translator) translateBlob(sha1 plumbing.Hash, src plumbing.EncodedObjec
 		return plumbing.ZeroHash, fmt.Errorf("blob store: %w", err)
 	}
 	t.mapping[sha1] = newHash
-	t.counts.Blobs++
+	t.blobs.Add(1)
 	return newHash, nil
 }
 
@@ -635,7 +684,7 @@ func (t *translator) translateTree(sha1 plumbing.Hash, src plumbing.EncodedObjec
 		return plumbing.ZeroHash, fmt.Errorf("store tree %s: %w", sha1, err)
 	}
 	t.mapping[sha1] = newHash
-	t.counts.Trees++
+	t.trees.Add(1)
 	return newHash, nil
 }
 
@@ -706,7 +755,7 @@ func (t *translator) translateCommit(sha1 plumbing.Hash, src plumbing.EncodedObj
 	}
 	t.mapping[sha1] = newHash
 	t.commits = append(t.commits, sha1)
-	t.counts.Commits++
+	t.commitsCount.Add(1)
 	return newHash, nil
 }
 
@@ -751,7 +800,7 @@ func (t *translator) translateTag(sha1 plumbing.Hash, src plumbing.EncodedObject
 		return plumbing.ZeroHash, fmt.Errorf("store tag %s: %w", sha1, err)
 	}
 	t.mapping[sha1] = newHash
-	t.counts.Tags++
+	t.tags.Add(1)
 	return newHash, nil
 }
 
@@ -1034,6 +1083,59 @@ func (t *translator) writeOriginNotes(refName string) (string, error) {
 	}
 	t.lastNotesCommit = commitHash
 	return refName, nil
+}
+
+// startProgressTick spawns a goroutine that, every 500 ms, rewrites a
+// single line in place on out with the string returned by render. The
+// returned stop function halts the goroutine and emits a trailing
+// newline so subsequent prints start on a fresh row.
+//
+// Only intended for TTY output: the rendered line uses '\r\x1b[K' to
+// overwrite itself, which looks fine on a terminal and ugly anywhere
+// else. Callers gate on isTTY before calling.
+func startProgressTick(out io.Writer, render func() string) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(500 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				fmt.Fprintf(out, "\r\x1b[K%s", render())
+			}
+		}
+	}()
+	stopOnce := false
+	return func() {
+		if stopOnce {
+			return
+		}
+		stopOnce = true
+		close(stop)
+		<-done
+		// Last frame + newline so subsequent output is on a clean row.
+		fmt.Fprintf(out, "\r\x1b[K%s\n", render())
+	}
+}
+
+// isTTY reports whether w is a writable terminal. The --progress
+// ticker is suppressed on non-TTY destinations because the '\r'-style
+// in-place updates would otherwise show up as literal control
+// characters in log files and pipes.
+func isTTY(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
 // writeMappingFile dumps the SHA1 → SHA256 mapping as a TSV. Lines are
