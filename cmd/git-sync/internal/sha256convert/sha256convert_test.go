@@ -1052,8 +1052,8 @@ func TestCheckSideOutputCollision(t *testing.T) {
 		{
 			name: "origin-notes collision refused by default",
 			desired: map[plumbing.ReferenceName]planner.DesiredRef{
-				"refs/heads/main":         mk("refs/heads/main"),
-				"refs/notes/sha1-origin":  mk("refs/notes/sha1-origin"),
+				"refs/heads/main":        mk("refs/heads/main"),
+				"refs/notes/sha1-origin": mk("refs/notes/sha1-origin"),
 			},
 			wantErrSubstring: "refs/notes/sha1-origin",
 		},
