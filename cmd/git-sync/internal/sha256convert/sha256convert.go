@@ -665,17 +665,28 @@ func runChecks(ctx context.Context, targetDir string, repo *git.Repository, refs
 	return checks
 }
 
-// fsckHasError reports whether git-fsck output contains a line that signals
-// a real problem (an "error:" or "fatal:" prefix, or a "missing"/"bad"
-// object report). Dangling and warning lines are ignored.
+// fsckHasError reports whether git-fsck output contains a line that
+// signals a real problem. We match (case-insensitively) any line whose
+// first token starts with "error" or "fatal" — covering "error:",
+// "fatal:", and the rare "errorInX:" variants — plus the
+// "missing <type> <sha>" / "broken link" / "bad <thing>" object reports
+// emitted by older git. Dangling and warning lines are intentionally
+// ignored.
+//
+// Splits on raw newlines rather than using bufio.Scanner so a single
+// very long line (some fsck reports include long paths) is not
+// silently truncated at the scanner's 64 KiB default.
 func fsckHasError(out []byte) bool {
-	scanner := bufio.NewScanner(bytes.NewReader(out))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "error:") || strings.HasPrefix(line, "fatal:") {
+	for _, raw := range bytes.Split(out, []byte("\n")) {
+		line := strings.TrimSpace(string(raw))
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "error") || strings.HasPrefix(lower, "fatal") {
 			return true
 		}
-		if strings.HasPrefix(line, "missing ") || strings.HasPrefix(line, "broken link") || strings.HasPrefix(line, "bad ") {
+		if strings.HasPrefix(lower, "missing ") || strings.HasPrefix(lower, "broken link") || strings.HasPrefix(lower, "bad ") {
 			return true
 		}
 	}
@@ -835,7 +846,6 @@ type translator struct {
 	// context passed to Run() and is not stored to outlive its caller.
 	ctx        context.Context //nolint:containedctx // translate() is recursive and not directly called by Run; threading ctx through every signature is noisier than a single field used for cancellation only.
 	src        *filesystem.Storage
-	dst        *filesystem.Storage
 	objectsDir string
 	// reachable holds every in-scope SHA1 with its object type, built up
 	// front by discoverReachable, which walks tree/commit/tag dependencies
@@ -862,6 +872,13 @@ type translator struct {
 	// so they know which references to investigate via the mapping
 	// file.
 	ambiguousMessageRefs map[string]struct{}
+	// resolveCache memoizes resolveMessageRef results. reachable is
+	// frozen before translation starts, so the (prefix → matchResult)
+	// mapping is stable for the lifetime of the translator.
+	// extractMessageReferences and rewriteHashesInMessage hit
+	// resolveMessageRef for the same tokens, and the abbreviated-hash
+	// path costs O(len(reachable)) per call — caching halves that.
+	resolveCache map[string]resolveCacheEntry
 	// Live counts updated atomically so the --progress ticker goroutine
 	// can sample them without racing against translation. Snapshot into
 	// a Counts struct at the end of the run.
@@ -889,8 +906,12 @@ func newTranslator(ctx context.Context, src, dst storer.Storer, targetDir string
 	if !ok {
 		return nil, fmt.Errorf("source storage is not filesystem-backed (%T)", src)
 	}
-	dstFS, ok := dst.(*filesystem.Storage)
-	if !ok {
+	// Type-check that the target is filesystem-backed too — we write
+	// loose objects by hand into targetDir/objects, bypassing the
+	// storer, but a memory-backed dst here would silently leave the
+	// caller's expected destination empty. Result is discarded: the
+	// translator only references targetDir directly.
+	if _, ok := dst.(*filesystem.Storage); !ok {
 		return nil, fmt.Errorf("target storage is not filesystem-backed (%T)", dst)
 	}
 	if reachable == nil {
@@ -899,12 +920,12 @@ func newTranslator(ctx context.Context, src, dst storer.Storer, targetDir string
 	return &translator{
 		ctx:                  ctx,
 		src:                  srcFS,
-		dst:                  dstFS,
 		objectsDir:           filepath.Join(targetDir, "objects"),
 		reachable:            reachable,
 		mapping:              make(map[plumbing.Hash]plumbing.Hash),
 		inProgress:           make(map[plumbing.Hash]struct{}),
 		ambiguousMessageRefs: make(map[string]struct{}),
+		resolveCache:         make(map[string]resolveCacheEntry),
 		rewriteMessages:      rewriteMessages,
 	}, nil
 }
@@ -930,21 +951,31 @@ func discoverReachable(ctx context.Context, src storer.Storer, roots []plumbing.
 		return nil, fmt.Errorf("source storage is not filesystem-backed (%T)", src)
 	}
 	reachable := make(map[plumbing.Hash]plumbing.ObjectType)
-	var visit func(plumbing.Hash) error
-	visit = func(sha1 plumbing.Hash) error {
+
+	// Iterative DFS with an explicit stack. The previous recursive
+	// implementation walked deep linear histories (50k–100k commits
+	// is not unheard of) one Go stack frame deep per parent edge,
+	// growing the goroutine stack by tens of MiB on kernel-scale
+	// runs. The explicit stack keeps memory usage proportional to
+	// the in-flight frontier, not the longest chain.
+	stack := make([]plumbing.Hash, 0, len(roots))
+	stack = append(stack, roots...)
+	for len(stack) > 0 {
 		// Per-object cancellation check. Discovery on a kernel-scale
-		// repo runs for several minutes before translate() takes over,
-		// so without this Ctrl-C would not interrupt the run until
-		// the discovery phase finished on its own.
+		// repo runs for several minutes before translate() takes
+		// over, so without this Ctrl-C would not interrupt the run
+		// until the discovery phase finished on its own.
 		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("discover %s: %w", sha1, err)
+			return nil, fmt.Errorf("discover: %w", err)
 		}
+		sha1 := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
 		if _, seen := reachable[sha1]; seen {
-			return nil
+			continue
 		}
 		obj, err := srcFS.EncodedObject(plumbing.AnyObject, sha1)
 		if err != nil {
-			return fmt.Errorf("discover %s: %w", sha1, err)
+			return nil, fmt.Errorf("discover %s: %w", sha1, err)
 		}
 		reachable[sha1] = obj.Type()
 		if progress != nil {
@@ -952,11 +983,11 @@ func discoverReachable(ctx context.Context, src storer.Storer, roots []plumbing.
 		}
 		switch obj.Type() { //nolint:exhaustive // OFSDelta/REFDelta/AnyObject/InvalidObject cannot reach a resolved storage.
 		case plumbing.BlobObject:
-			return nil
+			// No outgoing edges.
 		case plumbing.TreeObject:
 			tree := &object.Tree{}
 			if err := tree.Decode(obj); err != nil {
-				return fmt.Errorf("discover decode tree %s: %w", sha1, err)
+				return nil, fmt.Errorf("discover decode tree %s: %w", sha1, err)
 			}
 			for _, e := range tree.Entries {
 				if e.Mode == filemode.Submodule {
@@ -971,50 +1002,49 @@ func discoverReachable(ctx context.Context, src storer.Storer, roots []plumbing.
 					// safe answer is to refuse and let the caller scope
 					// the offending ref out (or convert the submodule
 					// upstream first and re-point .gitmodules).
-					return fmt.Errorf(
+					return nil, fmt.Errorf(
 						"tree %s contains a submodule gitlink %q at %s; convert-sha256 cannot rewrite submodule pointers "+
 							"because the linked-to repository would still advertise SHA1 hashes — "+
 							"exclude refs that reference it or convert the submodule repository first",
 						sha1, e.Name, e.Hash)
 				}
-				if err := visit(e.Hash); err != nil {
-					return err
-				}
+				stack = append(stack, e.Hash)
 			}
 		case plumbing.CommitObject:
 			c := &object.Commit{}
 			if err := c.Decode(obj); err != nil {
-				return fmt.Errorf("discover decode commit %s: %w", sha1, err)
+				return nil, fmt.Errorf("discover decode commit %s: %w", sha1, err)
 			}
-			if err := visit(c.TreeHash); err != nil {
-				return err
-			}
-			for _, p := range c.ParentHashes {
-				if err := visit(p); err != nil {
-					return err
-				}
-			}
+			stack = append(stack, c.TreeHash)
+			stack = append(stack, c.ParentHashes...)
 		case plumbing.TagObject:
 			tag := &object.Tag{}
 			if err := tag.Decode(obj); err != nil {
-				return fmt.Errorf("discover decode tag %s: %w", sha1, err)
+				return nil, fmt.Errorf("discover decode tag %s: %w", sha1, err)
 			}
-			if err := visit(tag.Target); err != nil {
-				return err
-			}
+			stack = append(stack, tag.Target)
 		default:
-			return fmt.Errorf("unexpected object type %v for %s during discovery", obj.Type(), sha1)
-		}
-		return nil
-	}
-	for _, r := range roots {
-		if err := visit(r); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("unexpected object type %v for %s during discovery", obj.Type(), sha1)
 		}
 	}
 	return reachable, nil
 }
 
+// translate is intentionally recursive. Unlike discoverReachable's
+// purely-structural DFS, translate's edges are dynamic: tree entries,
+// commit parents, tag targets, *and* message-reference edges resolved
+// against the partial mapping built so far. Converting that to an
+// explicit work stack would require an "after-children" callback per
+// object type and is easy to get subtly wrong (re-encoding before all
+// referenced hashes are placed silently corrupts the message rewrite).
+//
+// Recursion depth is bounded by the longest dependency chain in the
+// source DAG — in practice the longest commit-parent chain, since
+// trees and tags add at most one frame each. Linux kernel history is
+// O(70k) commits along its deepest single-parent path; Go's growable
+// stacks comfortably absorb that (~tens of MiB). Cycle detection above
+// turns any unexpected graph shape into a clear error rather than a
+// stack-overflow crash.
 func (t *translator) translate(sha1 plumbing.Hash) (plumbing.Hash, error) {
 	// Cheap per-object cancellation check so Ctrl-C during a long
 	// conversion (kernel-scale: ~10M objects) returns promptly rather
@@ -1402,11 +1432,27 @@ func (t *translator) rewriteHashesInMessage(msg string) (string, int) {
 // matchNone otherwise (no match, or the match is a blob/tree — those
 // are filtered so incidental hex collisions on content hashes aren't
 // rewritten).
+// resolveCacheEntry holds a memoized (Hash, matchResult) pair from
+// resolveMessageRef. Stored in t.resolveCache keyed by lowercased prefix.
+type resolveCacheEntry struct {
+	hash   plumbing.Hash
+	result matchResult
+}
+
 func (t *translator) resolveMessageRef(prefix string) (plumbing.Hash, matchResult) {
 	// Canonicalize to lowercase: hashPattern is case-insensitive so
 	// the caller can match `ABCD1234` in a message, but reachable
 	// keys and plumbing.Hash.String() are always lowercase hex.
 	prefix = strings.ToLower(prefix)
+	if cached, ok := t.resolveCache[prefix]; ok {
+		return cached.hash, cached.result
+	}
+	hash, result := t.resolveMessageRefUncached(prefix)
+	t.resolveCache[prefix] = resolveCacheEntry{hash: hash, result: result}
+	return hash, result
+}
+
+func (t *translator) resolveMessageRefUncached(prefix string) (plumbing.Hash, matchResult) {
 	if len(prefix) == 40 {
 		sha1, ok := plumbing.FromHex(prefix)
 		if !ok {
@@ -1631,7 +1677,16 @@ func (t *translator) writeMappingFile(path string) error {
 	if err != nil {
 		return fmt.Errorf("create %s: %w", path, err)
 	}
-	defer f.Close()
+	// Close is best-effort on the failure path (the underlying issue
+	// will already have surfaced via Flush). On the success path the
+	// explicit Close below propagates its error — networked / quota'd
+	// filesystems can defer write failures until close.
+	closed := false
+	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
+	}()
 	w := bufio.NewWriter(f)
 	if _, err := fmt.Fprintln(w, "# sha1\tsha256"); err != nil {
 		return fmt.Errorf("write mapping header: %w", err)
@@ -1644,6 +1699,10 @@ func (t *translator) writeMappingFile(path string) error {
 	if err := w.Flush(); err != nil {
 		return fmt.Errorf("flush mapping file: %w", err)
 	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close mapping file: %w", err)
+	}
+	closed = true
 	return nil
 }
 

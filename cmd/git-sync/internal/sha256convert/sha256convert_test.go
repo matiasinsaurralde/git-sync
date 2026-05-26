@@ -1260,6 +1260,78 @@ func TestHashPattern_CaseInsensitive(t *testing.T) {
 	}
 }
 
+// TestFsckHasError_HandlesLongLinesAndCase covers two fragility
+// fixes: lines longer than bufio.Scanner's 64 KiB default must not be
+// silently truncated (we use bytes.Split now), and the "error" /
+// "fatal" prefix match must be case-insensitive so e.g. older or
+// custom git builds emitting "ERROR:" still trip the check.
+func TestFsckHasError_HandlesLongLinesAndCase(t *testing.T) {
+	t.Run("long line still scanned", func(t *testing.T) {
+		// 100 KiB of dangling-blob filler followed by an error line.
+		out := append(bytes.Repeat([]byte("a"), 100*1024), []byte("\nerror: bad ref\n")...)
+		if !fsckHasError(out) {
+			t.Errorf("fsckHasError should detect error line after a long preceding line")
+		}
+	})
+	t.Run("uppercase ERROR matches", func(t *testing.T) {
+		if !fsckHasError([]byte("ERROR: corruption\n")) {
+			t.Errorf("fsckHasError should match uppercase ERROR")
+		}
+	})
+	t.Run("fatal without colon matches", func(t *testing.T) {
+		if !fsckHasError([]byte("Fatal failure in pack\n")) {
+			t.Errorf("fsckHasError should match Fatal prefix even without colon")
+		}
+	})
+	t.Run("dangling warnings are not errors", func(t *testing.T) {
+		if fsckHasError([]byte("dangling commit abc123\n")) {
+			t.Errorf("dangling lines should not trip fsckHasError")
+		}
+	})
+}
+
+// TestResolveMessageRef_Memoizes confirms a second call for the same
+// prefix doesn't re-scan reachable. We do not have a counter on the
+// scan, so we test the cache by mutating reachable between calls and
+// verifying the second call returns the original result. (In real
+// usage, reachable is frozen — this is just a behavioral observation
+// to lock in cache effectiveness.)
+func TestResolveMessageRef_Memoizes(t *testing.T) {
+	root := t.TempDir()
+	srcDir := filepath.Join(root, "src.git")
+	dstDir := filepath.Join(root, "dst.git")
+	srcRepo, err := git.PlainInit(srcDir, true)
+	if err != nil {
+		t.Fatalf("init src: %v", err)
+	}
+	dstRepo, err := git.PlainInit(dstDir, true, git.WithObjectFormat(formatcfg.SHA256))
+	if err != nil {
+		t.Fatalf("init dst: %v", err)
+	}
+	reachable := map[plumbing.Hash]plumbing.ObjectType{
+		plumbing.NewHash("abc1234567890abcdef1234567890abcdef12345"): plumbing.CommitObject,
+	}
+	tr, err := newTranslator(t.Context(), srcRepo.Storer, dstRepo.Storer, dstDir, true, reachable)
+	if err != nil {
+		t.Fatalf("newTranslator: %v", err)
+	}
+
+	prefix := "abc12345"
+	h1, r1 := tr.resolveMessageRef(prefix)
+	// Mutate reachable; if the cache works, the next call must return
+	// the same answer as the first.
+	for k := range tr.reachable {
+		delete(tr.reachable, k)
+	}
+	h2, r2 := tr.resolveMessageRef(prefix)
+	if h1 != h2 || r1 != r2 {
+		t.Errorf("resolveMessageRef should return cached value; got first (%s, %v) vs second (%s, %v)", h1, r1, h2, r2)
+	}
+	if _, cached := tr.resolveCache[strings.ToLower(prefix)]; !cached {
+		t.Errorf("resolveCache should contain entry for %q", prefix)
+	}
+}
+
 // TestRunChecks_TagOnlyConversionSkipsHEAD locks in the rule that a
 // tags-only conversion does not fail --check on HEAD. PlainInit leaves
 // HEAD pointing at refs/heads/master (which won't exist), and pickHEAD
