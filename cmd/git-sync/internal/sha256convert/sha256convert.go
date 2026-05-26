@@ -294,7 +294,7 @@ func Run(ctx context.Context, req Request) (Result, error) {
 		return Result{}, fmt.Errorf("init SHA256 target at %s: %w", req.TargetDir, err)
 	}
 
-	tr, err := newTranslator(srcRepo.Storer, dstRepo.Storer, req.TargetDir, !req.SkipMessageRewrite, reachable)
+	tr, err := newTranslator(ctx, srcRepo.Storer, dstRepo.Storer, req.TargetDir, !req.SkipMessageRewrite, reachable)
 	if err != nil {
 		return Result{}, err
 	}
@@ -678,6 +678,10 @@ func (a authAdapter) Authorizer(req *http.Request) error {
 // plumbing/format/objfile/writer.go:68), which would store every SHA256
 // object at a SHA1-derived path.
 type translator struct {
+	// ctx is checked at the top of every translate() call so a Ctrl-C
+	// during a million-object conversion is responsive. It is the same
+	// context passed to Run() and is not stored to outlive its caller.
+	ctx        context.Context //nolint:containedctx // translate() is recursive and not directly called by Run; threading ctx through every signature is noisier than a single field used for cancellation only.
 	src        *filesystem.Storage
 	dst        *filesystem.Storage
 	objectsDir string
@@ -728,7 +732,7 @@ func (t *translator) snapshotCounts() Counts {
 	}
 }
 
-func newTranslator(src, dst storer.Storer, targetDir string, rewriteMessages bool, reachable map[plumbing.Hash]plumbing.ObjectType) (*translator, error) {
+func newTranslator(ctx context.Context, src, dst storer.Storer, targetDir string, rewriteMessages bool, reachable map[plumbing.Hash]plumbing.ObjectType) (*translator, error) {
 	srcFS, ok := src.(*filesystem.Storage)
 	if !ok {
 		return nil, fmt.Errorf("source storage is not filesystem-backed (%T)", src)
@@ -741,6 +745,7 @@ func newTranslator(src, dst storer.Storer, targetDir string, rewriteMessages boo
 		reachable = make(map[plumbing.Hash]plumbing.ObjectType)
 	}
 	return &translator{
+		ctx:                  ctx,
 		src:                  srcFS,
 		dst:                  dstFS,
 		objectsDir:           filepath.Join(targetDir, "objects"),
@@ -848,6 +853,12 @@ func discoverReachable(src storer.Storer, roots []plumbing.Hash, progress *atomi
 }
 
 func (t *translator) translate(sha1 plumbing.Hash) (plumbing.Hash, error) {
+	// Cheap per-object cancellation check so Ctrl-C during a long
+	// conversion (kernel-scale: ~10M objects) returns promptly rather
+	// than running the whole DFS to completion.
+	if err := t.ctx.Err(); err != nil {
+		return plumbing.ZeroHash, fmt.Errorf("translate %s: %w", sha1, err)
+	}
 	if newH, ok := t.mapping[sha1]; ok {
 		return newH, nil
 	}

@@ -86,7 +86,7 @@ func TestTranslator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("discoverReachable: %v", err)
 	}
-	tr, err := newTranslator(srcRepo.Storer, dstRepo.Storer, dstDir, false, reachable)
+	tr, err := newTranslator(t.Context(), srcRepo.Storer, dstRepo.Storer, dstDir, false, reachable)
 	if err != nil {
 		t.Fatalf("newTranslator: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestTranslator_RewritesMessageHashes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("discoverReachable: %v", err)
 	}
-	tr, err := newTranslator(srcRepo.Storer, dstRepo.Storer, dstDir, true, reachable)
+	tr, err := newTranslator(t.Context(), srcRepo.Storer, dstRepo.Storer, dstDir, true, reachable)
 	if err != nil {
 		t.Fatalf("newTranslator: %v", err)
 	}
@@ -576,7 +576,7 @@ func initSHA256(t *testing.T, path string) *git.Repository {
 
 func mustTranslator(t *testing.T, src, dst gogitstorer.Storer, dir string, rewrite bool, reachable map[plumbing.Hash]plumbing.ObjectType) *translator {
 	t.Helper()
-	tr, err := newTranslator(src, dst, dir, rewrite, reachable)
+	tr, err := newTranslator(t.Context(), src, dst, dir, rewrite, reachable)
 	if err != nil {
 		t.Fatalf("newTranslator: %v", err)
 	}
