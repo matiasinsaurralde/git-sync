@@ -468,15 +468,25 @@ func signBranchTips(ctx context.Context, out io.Writer, targetDir, signKey, sour
 func runChecks(ctx context.Context, targetDir string, repo *git.Repository, refsExpected int) []Check {
 	checks := []Check{}
 
-	// 1. Config: extensions.objectformat = sha256.
-	cfgBytes, err := os.ReadFile(filepath.Join(targetDir, "config"))
+	// 1. Config: extensions.objectformat = sha256. Parse the file
+	// section-aware so we don't false-positive on a commented line or
+	// a similarly-named key in another section.
+	cfgFile, err := os.Open(filepath.Join(targetDir, "config"))
 	switch {
 	case err != nil:
 		checks = append(checks, Check{Name: "config", OK: false, Detail: err.Error()})
-	case !bytes.Contains(cfgBytes, []byte("objectformat = sha256")):
-		checks = append(checks, Check{Name: "config", OK: false, Detail: "extensions.objectformat = sha256 not set"})
 	default:
-		checks = append(checks, Check{Name: "config", OK: true, Detail: "extensions.objectformat = sha256"})
+		cfg := formatcfg.New()
+		decodeErr := formatcfg.NewDecoder(cfgFile).Decode(cfg)
+		_ = cfgFile.Close()
+		switch {
+		case decodeErr != nil:
+			checks = append(checks, Check{Name: "config", OK: false, Detail: fmt.Sprintf("parse config: %v", decodeErr)})
+		case !strings.EqualFold(cfg.Section("extensions").Option("objectformat"), "sha256"):
+			checks = append(checks, Check{Name: "config", OK: false, Detail: "extensions.objectformat = sha256 not set"})
+		default:
+			checks = append(checks, Check{Name: "config", OK: true, Detail: "extensions.objectformat = sha256"})
+		}
 	}
 
 	// 2. HEAD resolves to an existing object.
