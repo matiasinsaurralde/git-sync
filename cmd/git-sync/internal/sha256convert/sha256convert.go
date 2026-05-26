@@ -558,12 +558,33 @@ func runChecks(ctx context.Context, targetDir string, repo *git.Repository, refs
 	switch {
 	case err != nil:
 		checks = append(checks, Check{Name: "git fsck --full", OK: false, Detail: fmt.Sprintf("%v\n%s", err, fsckOut)})
-	case bytes.Contains(fsckOut, []byte("error")) || bytes.Contains(fsckOut, []byte("bad sha")):
+	case fsckHasError(fsckOut):
+		// Belt-and-braces against a hypothetical git version that prints
+		// "error:" / "fatal:" lines but exits zero. Match line prefixes
+		// rather than a substring so a branch or path containing "error"
+		// in a benign dangling/warning line doesn't trip the check.
 		checks = append(checks, Check{Name: "git fsck --full", OK: false, Detail: strings.TrimSpace(string(fsckOut))})
 	default:
 		checks = append(checks, Check{Name: "git fsck --full", OK: true, Detail: "clean"})
 	}
 	return checks
+}
+
+// fsckHasError reports whether git-fsck output contains a line that signals
+// a real problem (an "error:" or "fatal:" prefix, or a "missing"/"bad"
+// object report). Dangling and warning lines are ignored.
+func fsckHasError(out []byte) bool {
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "error:") || strings.HasPrefix(line, "fatal:") {
+			return true
+		}
+		if strings.HasPrefix(line, "missing ") || strings.HasPrefix(line, "broken link") || strings.HasPrefix(line, "bad ") {
+			return true
+		}
+	}
+	return false
 }
 
 const (
