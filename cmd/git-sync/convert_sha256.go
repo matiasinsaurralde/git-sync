@@ -42,14 +42,8 @@ any so the caller can convert the submodule repository first.`,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			req.ProtocolMode = gitsync.ProtocolMode(protocolVal)
-			if req.SourceURL == "" && len(args) > 0 {
-				req.SourceURL = args[0]
-			}
-			if req.TargetDir == "" && len(args) > 1 {
-				req.TargetDir = args[1]
-			}
-			if req.SourceURL == "" || req.TargetDir == "" {
-				return errors.New("convert-sha256 requires a source URL and a target directory")
+			if err := resolveConvertSHA256Args(&req, args); err != nil {
+				return err
 			}
 
 			result, err := sha256convert.Run(cmd.Context(), req)
@@ -99,4 +93,25 @@ any so the caller can convert the submodule repository first.`,
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "print JSON output")
 
 	return cmd
+}
+
+// resolveConvertSHA256Args consumes positional args left-to-right,
+// skipping fields the user already supplied via flags. Without that
+// rule, `--source-url <url> <dir>` would look like one positional and
+// land in SourceURL — leaving TargetDir empty even though the user
+// gave both. The two-flags-no-positionals and zero-flags-two-positionals
+// shapes also work, as do the symmetric --target-dir + positional URL.
+func resolveConvertSHA256Args(req *sha256convert.Request, args []string) error {
+	positional := args
+	if req.SourceURL == "" && len(positional) > 0 {
+		req.SourceURL = positional[0]
+		positional = positional[1:]
+	}
+	if req.TargetDir == "" && len(positional) > 0 {
+		req.TargetDir = positional[0]
+	}
+	if req.SourceURL == "" || req.TargetDir == "" {
+		return errors.New("convert-sha256 requires a source URL and a target directory")
+	}
+	return nil
 }
