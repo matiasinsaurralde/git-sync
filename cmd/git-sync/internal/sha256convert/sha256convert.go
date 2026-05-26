@@ -5,11 +5,12 @@
 //
 // The tool is intentionally scoped: no hash mapping is persisted, GPG
 // signatures on commits and tags are dropped (they sign over the original
-// SHA1 byte stream and would be invalid post-rewrite), and submodule
-// gitlinks are left at their original SHA1 hash unless the referenced
-// commit happens to live in the same repo. A run that encounters an
-// unresolvable submodule entry fails so the caller can choose which refs
-// to exclude.
+// SHA1 byte stream and would be invalid post-rewrite), and any submodule
+// gitlink fails the run so the caller chooses which refs to exclude. The
+// linked-to repository's URL still points at an upstream SHA1 store,
+// which has no way to resolve a SHA256-rewritten gitlink, so rewriting
+// would produce a tree that fsck-passes but breaks
+// `git submodule update`.
 package sha256convert
 
 import (
@@ -233,9 +234,20 @@ func Run(ctx context.Context, req Request) (Result, error) {
 		}
 	}()
 
+	// Build the result struct early so error paths can surface
+	// what little ran successfully. In particular, --keep-source-objects
+	// exists to debug failures, so cleanupTemp must flip and TempDir
+	// must be in the result *before* any later error return; otherwise
+	// the temp store gets wiped on exactly the runs that need it.
+	res := Result{SourceURL: req.SourceURL, TargetDir: req.TargetDir}
+	if req.KeepSourceObjects {
+		cleanupTemp = false
+		res.TempDir = tempDir
+	}
+
 	srcRepo, err := git.PlainInit(tempDir, true)
 	if err != nil {
-		return Result{}, fmt.Errorf("init temporary SHA1 store: %w", err)
+		return res, fmt.Errorf("init temporary SHA1 store: %w", err)
 	}
 
 	// Source connection + ref discovery -----------------------------------
@@ -249,7 +261,7 @@ func Run(ctx context.Context, req Request) (Result, error) {
 	}
 	conn, refService, sourceRefList, err := openSource(ctx, req, planCfg)
 	if err != nil {
-		return Result{}, err
+		return res, err
 	}
 	defer conn.Close()
 	refService.Verbose = req.Verbose
@@ -257,10 +269,10 @@ func Run(ctx context.Context, req Request) (Result, error) {
 	sourceRefs := gitproto.RefHashMap(sourceRefList)
 	desired, _, err := planner.BuildDesiredRefs(sourceRefs, planCfg)
 	if err != nil {
-		return Result{}, fmt.Errorf("build desired refs: %w", err)
+		return res, fmt.Errorf("build desired refs: %w", err)
 	}
 	if len(desired) == 0 {
-		return Result{}, errors.New("no source refs matched the requested scope")
+		return res, errors.New("no source refs matched the requested scope")
 	}
 
 	// Refuse before any further I/O if the source carries refs that
@@ -268,7 +280,7 @@ func Run(ctx context.Context, req Request) (Result, error) {
 	// writeOriginNotes / signBranchTips, so without this check the
 	// later side-output write would silently clobber the source ref.
 	if err := checkSideOutputCollision(desired, req.SkipOriginNotes, req.Sign); err != nil {
-		return Result{}, err
+		return res, err
 	}
 
 	// Fetch into temp SHA1 store ------------------------------------------
@@ -276,7 +288,7 @@ func Run(ctx context.Context, req Request) (Result, error) {
 	gpDesired := convert.DesiredRefs(desired)
 	if err := refService.FetchToStore(ctx, srcRepo.Storer, conn, gpDesired, nil); err != nil &&
 		!errors.Is(err, git.NoErrAlreadyUpToDate) {
-		return Result{}, fmt.Errorf("fetch source pack: %w", err)
+		return res, fmt.Errorf("fetch source pack: %w", err)
 	}
 
 	// Discover reachable set before initing the target. Submodule
@@ -303,18 +315,18 @@ func Run(ctx context.Context, req Request) (Result, error) {
 		stopDisc()
 	}
 	if err != nil {
-		return Result{}, fmt.Errorf("discover reachable: %w", err)
+		return res, fmt.Errorf("discover reachable: %w", err)
 	}
 
 	// Discovery succeeded — safe to materialize the SHA256 target.
 	dstRepo, err := git.PlainInit(req.TargetDir, true, git.WithObjectFormat(formatcfg.SHA256))
 	if err != nil {
-		return Result{}, fmt.Errorf("init SHA256 target at %s: %w", req.TargetDir, err)
+		return res, fmt.Errorf("init SHA256 target at %s: %w", req.TargetDir, err)
 	}
 
 	tr, err := newTranslator(ctx, srcRepo.Storer, dstRepo.Storer, req.TargetDir, !req.SkipMessageRewrite, reachable)
 	if err != nil {
-		return Result{}, err
+		return res, err
 	}
 	fmt.Fprintln(out, "translating objects to sha256 ...")
 	var stopTr func()
@@ -329,7 +341,7 @@ func Run(ctx context.Context, req Request) (Result, error) {
 			if stopTr != nil {
 				stopTr()
 			}
-			return Result{}, fmt.Errorf("translate %s: %w", d.SourceRef, err)
+			return res, fmt.Errorf("translate %s: %w", d.SourceRef, err)
 		}
 	}
 	if stopTr != nil {
@@ -339,7 +351,7 @@ func Run(ctx context.Context, req Request) (Result, error) {
 	// Write refs ---------------------------------------------------------
 	refsWritten, err := writeRefs(dstRepo.Storer, desired, tr.mapping)
 	if err != nil {
-		return Result{}, fmt.Errorf("write target refs: %w", err)
+		return res, fmt.Errorf("write target refs: %w", err)
 	}
 
 	// Point HEAD at a ref that actually exists in the target. PlainInit
@@ -348,19 +360,15 @@ func Run(ctx context.Context, req Request) (Result, error) {
 	// step. See pickHEAD for the selection order.
 	if headRef := pickHEAD(refService.HeadTarget, desired); headRef != "" {
 		if err := dstRepo.Storer.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, headRef)); err != nil {
-			return Result{}, fmt.Errorf("set HEAD: %w", err)
+			return res, fmt.Errorf("set HEAD: %w", err)
 		}
 	}
 
-	res := Result{
-		SourceURL:          req.SourceURL,
-		TargetDir:          req.TargetDir,
-		Protocol:           refService.Protocol,
-		RefsConverted:      refsWritten,
-		Counts:             tr.snapshotCounts(),
-		SignaturesStripped: tr.signaturesStripped,
-		MessageRewrites:    tr.messageRewrites,
-	}
+	res.Protocol = refService.Protocol
+	res.RefsConverted = refsWritten
+	res.Counts = tr.snapshotCounts()
+	res.SignaturesStripped = tr.signaturesStripped
+	res.MessageRewrites = tr.messageRewrites
 	if len(tr.ambiguousMessageRefs) > 0 {
 		amb := make([]string, 0, len(tr.ambiguousMessageRefs))
 		for s := range tr.ambiguousMessageRefs {
@@ -373,32 +381,32 @@ func Run(ctx context.Context, req Request) (Result, error) {
 	if !req.SkipOriginNotes && len(tr.commits) > 0 {
 		notesRef, err := tr.writeOriginNotes(originNotesRef)
 		if err != nil {
-			return Result{}, fmt.Errorf("write origin notes: %w", err)
+			return res, fmt.Errorf("write origin notes: %w", err)
 		}
 		if err := dstRepo.Storer.SetReference(plumbing.NewHashReference(plumbing.ReferenceName(notesRef), tr.lastNotesCommit)); err != nil {
-			return Result{}, fmt.Errorf("set %s: %w", notesRef, err)
+			return res, fmt.Errorf("set %s: %w", notesRef, err)
 		}
 		res.OriginNotesRef = notesRef
 	}
 
 	if req.MappingFile != "" {
 		if err := tr.writeMappingFile(req.MappingFile); err != nil {
-			return Result{}, fmt.Errorf("write mapping file: %w", err)
+			return res, fmt.Errorf("write mapping file: %w", err)
 		}
 		res.MappingFile = req.MappingFile
 	}
 
 	if req.Sign {
 		signed, err := signBranchTips(ctx, out, req.TargetDir, req.SignKey, req.SourceURL, desired)
+		// signBranchTips returns the tags it had already created
+		// when it failed mid-iteration. Surface that partial list
+		// even on error so the caller can clean up — without it,
+		// signed converted/* tags would be left on disk with no
+		// indication in either Result or the error.
+		res.SignedTags = signed
 		if err != nil {
 			return res, fmt.Errorf("sign: %w", err)
 		}
-		res.SignedTags = signed
-	}
-
-	if req.KeepSourceObjects {
-		cleanupTemp = false
-		res.TempDir = tempDir
 	}
 
 	if req.Check {
@@ -413,7 +421,14 @@ func Run(ctx context.Context, req Request) (Result, error) {
 		for _, tag := range res.SignedTags {
 			sideOutputs[plumbing.ReferenceName(tag)] = struct{}{}
 		}
-		res.Checks = runChecks(ctx, req.TargetDir, dstRepo, refsWritten, sideOutputs)
+		hasBranches := false
+		for _, d := range desired {
+			if d.TargetRef.IsBranch() {
+				hasBranches = true
+				break
+			}
+		}
+		res.Checks = runChecks(ctx, req.TargetDir, dstRepo, refsWritten, sideOutputs, hasBranches)
 		for _, c := range res.Checks {
 			mark := "✓"
 			if !c.OK {
@@ -500,7 +515,12 @@ func signBranchTips(ctx context.Context, out io.Writer, targetDir, signKey, sour
 // source set (the origin-notes ref, any --sign attestation tags), so
 // the refs check can omit them from the resolved/expected fraction
 // without false-positive-skipping a same-named source ref.
-func runChecks(ctx context.Context, targetDir string, repo *git.Repository, refsExpected int, sideOutputs map[plumbing.ReferenceName]struct{}) []Check {
+//
+// hasBranches says whether any refs/heads/* landed in the target. If
+// false, this is a tags-only conversion and HEAD is left at the
+// PlainInit default (refs/heads/master, which won't exist); the HEAD
+// check is then a no-op rather than a guaranteed failure.
+func runChecks(ctx context.Context, targetDir string, repo *git.Repository, refsExpected int, sideOutputs map[plumbing.ReferenceName]struct{}, hasBranches bool) []Check {
 	checks := []Check{}
 
 	// 1. Config: extensions.objectformat = sha256. Parse the file
@@ -524,18 +544,25 @@ func runChecks(ctx context.Context, targetDir string, repo *git.Repository, refs
 		}
 	}
 
-	// 2. HEAD resolves to an existing object.
-	head, err := repo.Reference(plumbing.HEAD, true)
+	// 2. HEAD resolves to an existing object. Skipped on tags-only
+	// conversions, where the target legitimately has no branch for
+	// HEAD to symlink to.
 	switch {
-	case err != nil:
-		checks = append(checks, Check{Name: "HEAD", OK: false, Detail: err.Error()})
-	case head.Hash().IsZero():
-		checks = append(checks, Check{Name: "HEAD", OK: false, Detail: "resolves to zero hash"})
+	case !hasBranches:
+		checks = append(checks, Check{Name: "HEAD", OK: true, Detail: "skipped (tags-only conversion; no branch to point at)"})
 	default:
-		if _, err := repo.Storer.EncodedObject(plumbing.AnyObject, head.Hash()); err != nil {
-			checks = append(checks, Check{Name: "HEAD", OK: false, Detail: fmt.Sprintf("%s: %v", head.Hash(), err)})
-		} else {
-			checks = append(checks, Check{Name: "HEAD", OK: true, Detail: head.Hash().String()})
+		head, err := repo.Reference(plumbing.HEAD, true)
+		switch {
+		case err != nil:
+			checks = append(checks, Check{Name: "HEAD", OK: false, Detail: err.Error()})
+		case head.Hash().IsZero():
+			checks = append(checks, Check{Name: "HEAD", OK: false, Detail: "resolves to zero hash"})
+		default:
+			if _, err := repo.Storer.EncodedObject(plumbing.AnyObject, head.Hash()); err != nil {
+				checks = append(checks, Check{Name: "HEAD", OK: false, Detail: fmt.Sprintf("%s: %v", head.Hash(), err)})
+			} else {
+				checks = append(checks, Check{Name: "HEAD", OK: true, Detail: head.Hash().String()})
+			}
 		}
 	}
 
@@ -892,15 +919,21 @@ func discoverReachable(src storer.Storer, roots []plumbing.Hash, progress *atomi
 			}
 			for _, e := range tree.Entries {
 				if e.Mode == filemode.Submodule {
-					if _, err := srcFS.EncodedObject(plumbing.CommitObject, e.Hash); err == nil {
-						if err := visit(e.Hash); err != nil {
-							return err
-						}
-						continue
-					}
+					// A submodule gitlink stores a hash that refers to a
+					// commit in a *different* repository — the one named
+					// by the matching .gitmodules URL. Even when that
+					// commit happens to be in our source store, the URL
+					// still points at an upstream SHA1 repo, so rewriting
+					// the gitlink to SHA256 produces a tree that fsck-
+					// passes but breaks `git submodule update` forever:
+					// the upstream advertises only SHA1 hashes. The only
+					// safe answer is to refuse and let the caller scope
+					// the offending ref out (or convert the submodule
+					// upstream first and re-point .gitmodules).
 					return fmt.Errorf(
-						"tree %s contains a submodule gitlink %q at %s that is not present in the source repo; "+
-							"convert the submodule repository first so its commit hashes are available in SHA256",
+						"tree %s contains a submodule gitlink %q at %s; convert-sha256 cannot rewrite submodule pointers "+
+							"because the linked-to repository would still advertise SHA1 hashes — "+
+							"exclude refs that reference it or convert the submodule repository first",
 						sha1, e.Name, e.Hash)
 				}
 				if err := visit(e.Hash); err != nil {
@@ -1008,26 +1041,13 @@ func (t *translator) translateTree(sha1 plumbing.Hash, src plumbing.EncodedObjec
 	}
 	for i, entry := range tree.Entries {
 		if entry.Mode == filemode.Submodule {
-			// Submodule gitlinks reference a commit in a different repo.
-			// We can only translate if that commit happens to live in our
-			// SHA1 store too (rare, e.g. vendored). Otherwise the SHA1
-			// pointer can't be embedded in a SHA256 tree, so we error
-			// out and let the caller scope around it.
-			if _, ok := t.mapping[entry.Hash]; ok {
-				tree.Entries[i].Hash = t.mapping[entry.Hash]
-				continue
-			}
-			if _, err := t.src.EncodedObject(plumbing.CommitObject, entry.Hash); err == nil {
-				newH, err := t.translate(entry.Hash)
-				if err != nil {
-					return plumbing.ZeroHash, err
-				}
-				tree.Entries[i].Hash = newH
-				continue
-			}
+			// Should not be reachable: discoverReachable refuses any
+			// submodule gitlink up-front. Keep this as a defensive
+			// guard so the rewrite path never silently produces a
+			// SHA256 tree whose gitlink points at a hash the
+			// .gitmodules upstream repo cannot resolve.
 			return plumbing.ZeroHash, fmt.Errorf(
-				"tree %s contains submodule gitlink %q at %s that is not present in the source repo; "+
-					"exclude refs that reference it or convert the submodule repository first",
+				"tree %s contains submodule gitlink %q at %s; convert-sha256 refuses to rewrite submodule pointers",
 				sha1, entry.Name, entry.Hash)
 		}
 		newH, err := t.translate(entry.Hash)

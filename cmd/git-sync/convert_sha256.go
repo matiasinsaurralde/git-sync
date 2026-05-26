@@ -33,10 +33,12 @@ to preserve the always-convert invariant.
 
 The conversion is destructive in two ways the caller should be aware of:
 GPG signatures on commits and tags are dropped (they sign over the
-original SHA1 content and would be invalid post-rewrite), and submodule
-gitlinks that point at a commit outside this repository cannot be
-embedded in a SHA256 tree — the command exits with an error if it finds
-any so the caller can convert the submodule repository first.`,
+original SHA1 content and would be invalid post-rewrite), and any
+submodule gitlink fails the run — its .gitmodules upstream still
+advertises SHA1 hashes, so a rewritten SHA256 gitlink would point at a
+hash the upstream cannot resolve and break ` + "`git submodule update`" + ` in
+every clone. Exclude refs that reference submodules, or convert the
+submodule repository first and re-point .gitmodules.`,
 		Args:          cobra.MaximumNArgs(2),
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -47,10 +49,18 @@ any so the caller can convert the submodule repository first.`,
 			}
 
 			result, err := sha256convert.Run(cmd.Context(), req)
+			// Print whatever state Run produced even on error: signed
+			// tags landed before signBranchTips failed, --check
+			// findings, and the --keep-source-objects temp dir are
+			// all things the user needs to see to clean up or debug.
+			// Run zero-values fields it never touched, so this is
+			// safe to call on a half-populated result.
+			if result.SourceURL != "" || result.TargetDir != "" {
+				printOutput(jsonOutput, result)
+			}
 			if err != nil {
 				return fmt.Errorf("convert-sha256: %w", err)
 			}
-			printOutput(jsonOutput, result)
 			return nil
 		},
 	}

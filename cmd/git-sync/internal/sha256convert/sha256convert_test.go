@@ -553,6 +553,45 @@ func TestTranslator_UnresolvableSubmodule(t *testing.T) {
 	}
 }
 
+// TestTranslator_VendoredSubmoduleStillRefused locks in the rule that
+// even a submodule whose commit happens to live in the source store is
+// rejected. The earlier "vendored" carve-out rewrote such gitlinks to
+// SHA256, but .gitmodules still points at an upstream SHA1 repo, so
+// `git submodule update` would fail in clones of the converted repo.
+func TestTranslator_VendoredSubmoduleStillRefused(t *testing.T) {
+	root := t.TempDir()
+	srcDir := filepath.Join(root, "src.git")
+
+	srcRepo, err := git.PlainInit(srcDir, true)
+	if err != nil {
+		t.Fatalf("init SHA1 source: %v", err)
+	}
+
+	// Create a commit that lives in this source store, then point a
+	// tree's submodule gitlink at it. discoverReachable used to recurse
+	// into that commit ("vendored") and translate the gitlink; now it
+	// refuses regardless.
+	blobHash := writeBlob(t, srcRepo.Storer, []byte("inner\n"))
+	innerTree := writeTree(t, srcRepo.Storer, []object.TreeEntry{
+		{Name: "f", Mode: filemode.Regular, Hash: blobHash},
+	})
+	sig := object.Signature{Name: "Test", Email: "t@example.com", When: time.Unix(1700000000, 0).UTC()}
+	innerCommit := &object.Commit{Author: sig, Committer: sig, Message: "inner\n", TreeHash: innerTree}
+	innerSHA1 := writeObject(t, srcRepo.Storer, innerCommit.Encode)
+
+	outerTree := writeTree(t, srcRepo.Storer, []object.TreeEntry{
+		{Name: "sub", Mode: filemode.Submodule, Hash: innerSHA1},
+	})
+
+	_, err = discoverReachable(srcRepo.Storer, []plumbing.Hash{outerTree}, nil)
+	if err == nil {
+		t.Fatal("expected discoverReachable to refuse vendored submodule, got nil")
+	}
+	if !strings.Contains(err.Error(), "submodule") {
+		t.Errorf("error should mention submodule; got: %v", err)
+	}
+}
+
 // --- helpers ---
 
 // initSHA1 and initSHA256 are t.Fatalf-wrapping `git.PlainInit` shortcuts
@@ -1104,6 +1143,37 @@ func TestCheckSideOutputCollision(t *testing.T) {
 				t.Fatalf("error %q does not contain %q", err.Error(), tt.wantErrSubstring)
 			}
 		})
+	}
+}
+
+// TestRunChecks_TagOnlyConversionSkipsHEAD locks in the rule that a
+// tags-only conversion does not fail --check on HEAD. PlainInit leaves
+// HEAD pointing at refs/heads/master (which won't exist), and pickHEAD
+// returns "" because the desired set has no branches; runChecks must
+// detect that and mark HEAD as "skipped" rather than "missing".
+func TestRunChecks_TagOnlyConversionSkipsHEAD(t *testing.T) {
+	dir := t.TempDir()
+	repo, err := git.PlainInit(dir, true, git.WithObjectFormat(formatcfg.SHA256))
+	if err != nil {
+		t.Fatalf("init SHA256 target: %v", err)
+	}
+
+	checks := runChecks(t.Context(), dir, repo, 0, nil, false)
+	var head Check
+	for _, c := range checks {
+		if c.Name == "HEAD" {
+			head = c
+			break
+		}
+	}
+	if head.Name == "" {
+		t.Fatalf("HEAD check missing from runChecks output")
+	}
+	if !head.OK {
+		t.Errorf("HEAD should be OK (skipped) for tags-only conversion, got %+v", head)
+	}
+	if !strings.Contains(head.Detail, "skipped") {
+		t.Errorf("HEAD check should record skipped reason, got %q", head.Detail)
 	}
 }
 
