@@ -702,7 +702,6 @@ func ensureEmptyTarget(path string) error {
 	return nil
 }
 
-//nolint:ireturn // gitproto.Conn is the shared transport interface; returning it directly mirrors the rest of git-sync.
 func openSource(ctx context.Context, req Request, planCfg planner.PlanConfig) (gitproto.Conn, *gitproto.RefService, []*plumbing.Reference, error) {
 	ep, err := url.Parse(req.SourceURL)
 	if err != nil {
@@ -737,7 +736,6 @@ func openSource(ctx context.Context, req Request, planCfg planner.PlanConfig) (g
 	return conn, svc, refs, nil
 }
 
-//nolint:ireturn // gitproto.AuthMethod is the shared signing interface; returning it lets callers pass it straight through.
 func normalizeAuth(m auth.Method) gitproto.AuthMethod {
 	if m == nil {
 		return nil

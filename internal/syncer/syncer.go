@@ -349,7 +349,7 @@ func measurementLine(m Measurement) []string {
 
 // --- Session setup ---
 
-func newConn(raw Endpoint, label string, stats *statsCollector, httpClient *http.Client) (gitproto.Conn, error) { //nolint:ireturn // transport selection intentionally returns the shared connection interface
+func newConn(raw Endpoint, label string, stats *statsCollector, httpClient *http.Client) (gitproto.Conn, error) {
 	ep, err := transport.ParseURL(raw.URL)
 	if err != nil {
 		return nil, fmt.Errorf("parse endpoint: %w", err)
