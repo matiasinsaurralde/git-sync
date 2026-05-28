@@ -15,6 +15,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/protocol/capability"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/transport"
+	"github.com/go-git/go-git/v6/storage/memory"
 	"github.com/stretchr/testify/require"
 )
 
@@ -227,6 +228,11 @@ func TestPushPackClosesPackOnContextCanceled(t *testing.T) {
 	}
 }
 
+// TestPushPackStartsHTTPBeforePackFullyRead asserts that PushPack — the
+// relay path — keeps streaming source pack bytes through to the target
+// with chunked encoding. Materialized push (PushObjects) gets the same
+// property via precomputed delta selection; see
+// TestPushObjectsStreamsBody.
 func TestPushPackStartsHTTPBeforePackFullyRead(t *testing.T) {
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -273,6 +279,72 @@ func TestPushPackStartsHTTPBeforePackFullyRead(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("PushPack did not complete after releasing pack")
+	}
+}
+
+// TestPushObjectsStreamsBody asserts that PushObjects sends a chunked
+// receive-pack request — the streaming property is what avoids the
+// mid-stream stall (delta selection runs before the body opens, so
+// pack bytes flow continuously once writing starts). A request with
+// no Transfer-Encoding: chunked would mean we've regressed to
+// buffering the whole pack before sending.
+func TestPushObjectsStreamsBody(t *testing.T) {
+	type observation struct {
+		transferEncoding []string
+		contentLength    int64
+		bodyLen          int64
+	}
+	observed := make(chan observation, 1)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, err := io.Copy(io.Discard, r.Body)
+		if err != nil {
+			t.Logf("drain request body: %v", err)
+		}
+		_ = r.Body.Close()
+		observed <- observation{
+			transferEncoding: r.TransferEncoding,
+			contentLength:    r.ContentLength,
+			bodyLen:          n,
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	conn := connForServer(t, srv)
+	adv := &packp.AdvRefs{}
+	adv.Capabilities.Set(capability.OFSDelta)
+
+	err := PushObjects(context.Background(), conn, adv, []PushCommand{{
+		Name: "refs/heads/main",
+		New:  plumbing.NewHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+	}}, memory.NewStorage(), nil, false, nil)
+	if err != nil {
+		t.Fatalf("PushObjects: %v", err)
+	}
+
+	var obs observation
+	select {
+	case obs = <-observed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not receive request")
+	}
+
+	chunked := false
+	for _, te := range obs.transferEncoding {
+		if te == "chunked" {
+			chunked = true
+			break
+		}
+	}
+	if !chunked {
+		t.Errorf("Transfer-Encoding = %v, want to include \"chunked\"", obs.transferEncoding)
+	}
+	if obs.contentLength != -1 {
+		t.Errorf("Content-Length = %d, want -1 (unknown for chunked)", obs.contentLength)
+	}
+	if obs.bodyLen <= 0 {
+		t.Errorf("bodyLen = %d, want > 0", obs.bodyLen)
 	}
 }
 

@@ -8,7 +8,10 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/http/httptrace"
+	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/go-git/go-git/v6/plumbing/protocol/capability"
@@ -62,6 +65,111 @@ func httpError(res *http.Response) error {
 // StatsPhaseHeader is the HTTP header used to annotate requests with the
 // current git-sync stats phase for round-trip tracking.
 const StatsPhaseHeader = "X-Git-Sync-Stats-Phase"
+
+// HTTPTraceEnv enables verbose httptrace logging to stderr when set to any
+// non-empty value other than "0" or "false". Diagnoses connection-pool
+// behavior against hosts that close idle keep-alive connections more
+// aggressively than Go's transport assumes (CDN edges, some hosted git
+// providers) — a stale pooled connection surfaces as "use of closed network
+// connection" on the next POST. Off by default; zero overhead unless set.
+const HTTPTraceEnv = "GITSYNC_HTTP_TRACE"
+
+func httpTraceEnabled() bool {
+	v := os.Getenv(HTTPTraceEnv)
+	if v == "" {
+		return false
+	}
+	switch strings.ToLower(v) {
+	case "0", "false", "no", "off":
+		return false
+	}
+	return true
+}
+
+// withHTTPTrace returns ctx with a ClientTrace that logs connection lifecycle
+// events for one request to stderr. label is prepended to every line so
+// concurrent or interleaved requests stay readable. Returns ctx unchanged
+// when GITSYNC_HTTP_TRACE is not enabled.
+func withHTTPTrace(ctx context.Context, label string) context.Context {
+	if !httpTraceEnabled() {
+		return ctx
+	}
+	trace := &httptrace.ClientTrace{
+		GetConn: func(hostPort string) {
+			fmt.Fprintf(os.Stderr, "[httptrace] %s GetConn %s\n", label, hostPort)
+		},
+		GotConn: func(info httptrace.GotConnInfo) {
+			fmt.Fprintf(os.Stderr,
+				"[httptrace] %s GotConn reused=%v wasIdle=%v idle=%s local=%s remote=%s\n",
+				label, info.Reused, info.WasIdle, info.IdleTime,
+				info.Conn.LocalAddr(), info.Conn.RemoteAddr())
+		},
+		PutIdleConn: func(err error) {
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[httptrace] %s PutIdleConn err=%v\n", label, err)
+			} else {
+				fmt.Fprintf(os.Stderr, "[httptrace] %s PutIdleConn ok\n", label)
+			}
+		},
+		ConnectStart: func(network, addr string) {
+			fmt.Fprintf(os.Stderr, "[httptrace] %s ConnectStart %s %s\n", label, network, addr)
+		},
+		ConnectDone: func(network, addr string, err error) {
+			fmt.Fprintf(os.Stderr, "[httptrace] %s ConnectDone %s %s err=%v\n", label, network, addr, err)
+		},
+		TLSHandshakeStart: func() {
+			fmt.Fprintf(os.Stderr, "[httptrace] %s TLSHandshakeStart\n", label)
+		},
+		TLSHandshakeDone: func(state tls.ConnectionState, err error) {
+			fmt.Fprintf(os.Stderr, "[httptrace] %s TLSHandshakeDone resumed=%v err=%v\n",
+				label, state.DidResume, err)
+		},
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			fmt.Fprintf(os.Stderr, "[httptrace] %s WroteRequest err=%v\n", label, info.Err)
+		},
+	}
+	return httptrace.WithClientTrace(ctx, trace)
+}
+
+// dumpOutgoingRequest prints the wire-format request line and headers for
+// req to stderr, prefixed with label. The body is not consumed (passes
+// body=false to httputil.DumpRequestOut), but Transfer-Encoding and
+// Content-Length will reflect what Go's transport would actually send.
+// Useful when a server behaves unexpectedly on a POST and you need to
+// see what the request looked like at the protocol level — the
+// connection-level trace tells you which TCP/TLS connection was used
+// but not what was written on it. Best-effort: dump errors are
+// surfaced as a single line so a transient dump failure doesn't mask
+// the underlying request.
+func dumpOutgoingRequest(req *http.Request, label string) {
+	dump, err := httputil.DumpRequestOut(req, false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[httptrace] %s dump error: %v\n", label, err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[httptrace] %s outgoing request:\n%s\n", label, redactAuthorization(dump))
+}
+
+// redactAuthorization scrubs any Authorization header value from a dumped
+// HTTP request so the credentials don't leak into stderr when
+// GITSYNC_HTTP_TRACE is enabled in environments with shoulder-surfers,
+// pasted-into-tickets logs, or shared shells.
+func redactAuthorization(dump []byte) []byte {
+	const header = "Authorization:"
+	idx := bytes.Index(dump, []byte(header))
+	if idx < 0 {
+		return dump
+	}
+	end := bytes.IndexByte(dump[idx:], '\n')
+	if end < 0 {
+		end = len(dump) - idx
+	}
+	out := make([]byte, 0, len(dump))
+	out = append(out, dump[:idx]...)
+	out = append(out, []byte(header+" [REDACTED]")...)
+	out = append(out, dump[idx+end:]...)
+	return out
+}
 
 // AuthMethod authorizes outbound HTTP requests for a remote. It is satisfied
 // by *transporthttp.BasicAuth and *transporthttp.TokenAuth, whose Authorizer
@@ -134,20 +242,38 @@ func normalizeEndpointPath(ep *url.URL) {
 	ep.RawPath = strings.TrimRight(ep.RawPath, "/")
 }
 
-// NewHTTPTransport creates an http.Transport with optional TLS skip.
+// NewHTTPTransport returns the default git-sync HTTP transport. It clones
+// http.DefaultTransport so config changes (TLS, keep-alive policy) don't
+// leak into other code in the same process.
+//
+// Keep-alives are disabled. The git smart-HTTP workflow over the same host
+// is coarse-grained — info/refs, then a single upload-pack or receive-pack
+// POST — with real work in between (planning, source fetch, local object
+// materialization). On the push side that gap is long enough for CDN
+// edges and some hosted git providers to close their end of an idle TLS
+// socket; the next POST then fails with "use of closed network connection"
+// because the pooled connection is half-dead. Pool reuse would save at
+// most one TLS handshake per sync, which is negligible against multi-MB
+// to multi-GB transfers, so we prefer a fresh connection per request and
+// avoid the race entirely.
+//
+// Library callers that need pool reuse (e.g. embedding git-sync in a
+// long-running process that hits the same host repeatedly with short
+// gaps) can pass their own RoundTripper to NewHTTPConn instead.
 func NewHTTPTransport(skipTLS bool) http.RoundTripper {
-	if !skipTLS {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
 		return http.DefaultTransport
 	}
-	if cloned, ok := http.DefaultTransport.(*http.Transport); ok {
-		tc := cloned.Clone()
+	tc := base.Clone()
+	tc.DisableKeepAlives = true
+	if skipTLS {
 		if tc.TLSClientConfig == nil {
 			tc.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 		}
 		tc.TLSClientConfig.InsecureSkipVerify = true
-		return tc
 	}
-	return http.DefaultTransport
+	return tc
 }
 
 // RequestInfoRefs fetches /info/refs for the given service.
@@ -162,6 +288,7 @@ func RequestInfoRefs(ctx context.Context, conn Conn, service string, gitProtocol
 // RequestInfoRefs fetches /info/refs for the given service.
 func (c *HTTPConn) RequestInfoRefs(ctx context.Context, service string, gitProtocol string) ([]byte, error) {
 	reqURL := fmt.Sprintf("%s/info/refs?service=%s", c.EndpointURL.String(), service)
+	ctx = withHTTPTrace(ctx, "GET "+service+"/info/refs")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create info-refs request: %w", err)
@@ -251,8 +378,12 @@ func PostRPCStreamBody(ctx context.Context, conn Conn, service string, body io.R
 
 // PostRPCStreamBody sends a POST to the given service using a streaming request body.
 // Caller must close the returned ReadCloser.
+//
+// The body is sent as-is — streaming readers produce a chunked request.
 func (c *HTTPConn) PostRPCStreamBody(ctx context.Context, service string, body io.Reader, v2 bool, phase string) (io.ReadCloser, error) {
 	reqURL := fmt.Sprintf("%s/%s", c.EndpointURL.String(), service)
+	ctx = withHTTPTrace(ctx, "POST "+service)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, body)
 	if err != nil {
 		return nil, fmt.Errorf("create RPC request: %w", err)
@@ -265,6 +396,10 @@ func (c *HTTPConn) PostRPCStreamBody(ctx context.Context, service string, body i
 		req.Header.Set("Git-Protocol", GitProtocolV2)
 	}
 	ApplyAuth(req, c.Auth)
+
+	if httpTraceEnabled() {
+		dumpOutgoingRequest(req, "POST "+service)
+	}
 
 	res, err := c.HTTP.Do(req)
 	if err != nil {
