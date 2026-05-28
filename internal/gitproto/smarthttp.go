@@ -214,6 +214,16 @@ type HTTPConn struct {
 	// callers that rely on Endpoint being stable.
 	FollowInfoRefsRedirect bool
 
+	// InsecureSkipTLSVerify mirrors the same-named transport setting and
+	// must be set by callers whenever the HTTP client they pass in has
+	// TLS verification disabled. The credential-helper retry path uses it
+	// to refuse cross-host operations: with TLS verification off there's
+	// no way to know whether a redirect's destination is the host the
+	// user trusts or a MITM impersonating it, so sending the helper's
+	// stored credentials there is unsafe. Same-host 401s (no redirect)
+	// still retry — the user has accepted whatever host they configured.
+	InsecureSkipTLSVerify bool
+
 	// ProgressOut is the destination for verbose sideband progress
 	// messages ("Enumerating objects: ...", "Resolving deltas: ..."
 	// streamed by upload-pack and receive-pack). Nil falls back to
@@ -551,6 +561,13 @@ func (c *HTTPConn) EnsureAuthForService(ctx context.Context, service string) {
 		return
 	}
 	challengeURL := challengeURLFor(c.EndpointURL, res)
+	if c.InsecureSkipTLSVerify && challengeURL.Host != c.EndpointURL.Host {
+		// See tryHelperRetry: with TLS verification off we can't tell a
+		// real challenger from a MITM, so we won't attach helper creds
+		// after a cross-host probe redirect. The real op will surface
+		// the 401 and the user can resolve it.
+		return
+	}
 	user, pass, ok, lookupErr := c.CredentialHelper.Lookup(ctx, challengeURL)
 	if lookupErr != nil || !ok {
 		return
@@ -639,6 +656,15 @@ func (c *HTTPConn) tryHelperRetry(ctx context.Context, res *http.Response, retry
 		return res, nil
 	}
 	challengeURL := challengeURLFor(c.EndpointURL, res)
+	if c.InsecureSkipTLSVerify && challengeURL.Host != c.EndpointURL.Host {
+		// Refuse to hand helper-stored credentials to a redirect target we
+		// can't authenticate. With TLS verification off, the post-redirect
+		// host could be anyone presenting a self-signed cert for the host
+		// our Lookup key would hand creds to. Let the 401 surface so the
+		// user fixes their setup (don't combine SkipTLSVerify with a
+		// credential helper on a redirecting endpoint).
+		return res, nil
+	}
 	user, pass, ok, lookupErr := c.CredentialHelper.Lookup(ctx, challengeURL)
 	if lookupErr != nil {
 		_ = res.Body.Close()

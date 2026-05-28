@@ -16,10 +16,14 @@ import (
 	transporthttp "github.com/go-git/go-git/v6/plumbing/transport/http"
 )
 
-// testReplicaHost is the hostname tests use to model a cross-host redirect
-// target (the user-facing origin is "example.com" via newTestConn). Used by
+// testOriginHost is the hostname newTestConn points its endpoint at — the
+// origin / user-configured host. testReplicaHost is the hostname tests use
+// to model a cross-host redirect target landing somewhere else. Used by
 // the redirect/cross-host fixtures across several tests.
-const testReplicaHost = "replica.example"
+const (
+	testOriginHost  = "example.com"
+	testReplicaHost = "replica.example"
+)
 
 func TestNewHTTPConn(t *testing.T) {
 	ep, err := transport.ParseURL("https://github.com/user/repo.git")
@@ -490,7 +494,7 @@ func newUnauthorizedResponse(req *http.Request) *http.Response {
 
 func newTestConn(_ *testing.T, rt http.RoundTripper) *HTTPConn {
 	return NewHTTPConn(
-		&url.URL{Scheme: "https", Host: "example.com", Path: "/repo.git"},
+		&url.URL{Scheme: "https", Host: testOriginHost, Path: "/repo.git"},
 		"src", nil, rt,
 	)
 }
@@ -820,7 +824,7 @@ func TestRequestInfoRefs_OnUnauthorizedAfterCrossHostRedirectRetriesAgainstChall
 	conn := newTestConn(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		calls = append(calls, call{host: req.URL.Host, auth: req.Header.Get("Authorization")})
 		switch req.URL.Host {
-		case "example.com":
+		case testOriginHost:
 			// Cross-host 307. Go's http.Client follows and strips Authorization
 			// (which is moot here — the first attempt is anonymous).
 			res := &http.Response{
@@ -874,6 +878,92 @@ func TestRequestInfoRefs_OnUnauthorizedAfterCrossHostRedirectRetriesAgainstChall
 	// pending creds end up Reject'd at resolvePendingHelperCreds time.
 	if conn.EndpointURL.Host != testReplicaHost {
 		t.Errorf("expected conn.EndpointURL.Host to adopt replica.example, got %q", conn.EndpointURL.Host)
+	}
+}
+
+// TestRequestInfoRefs_CrossHostRedirectWithSkipTLSVerifyRefusesToSendCreds
+// covers the safety gate: when TLS verification is off, a cross-host
+// redirect's destination can't be authenticated (any MITM presenting a
+// self-signed cert would do), so we MUST NOT hand the helper's stored
+// credentials over. We bail out of the retry and let the 401 surface;
+// the user has to either turn TLS verification back on or stop relying
+// on a redirecting endpoint.
+func TestRequestInfoRefs_CrossHostRedirectWithSkipTLSVerifyRefusesToSendCreds(t *testing.T) {
+	helper := &fakeCredentialHelper{user: "alice", pass: "s3cret", ok: true}
+	type call struct{ host, auth string }
+	var calls []call
+	conn := newTestConn(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, call{host: req.URL.Host, auth: req.Header.Get("Authorization")})
+		switch req.URL.Host {
+		case testOriginHost:
+			res := &http.Response{
+				StatusCode: http.StatusTemporaryRedirect,
+				Request:    req,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("")),
+			}
+			res.Header.Set("Location", "https://"+testReplicaHost+"/repo.git/info/refs?service=git-upload-pack")
+			return res, nil
+		case testReplicaHost:
+			return newUnauthorizedResponse(req), nil
+		}
+		return nil, fmt.Errorf("unexpected host %s", req.URL.Host)
+	}))
+	conn.CredentialHelper = helper
+	conn.InsecureSkipTLSVerify = true
+
+	_, err := conn.RequestInfoRefs(context.Background(), "git-upload-pack", "")
+	if err == nil {
+		t.Fatal("expected 401 to surface when TLS verification is off and the challenge crosses hosts")
+	}
+	if !strings.Contains(err.Error(), "401") {
+		t.Errorf("expected a 401 error, got %v", err)
+	}
+
+	// No helper traffic at all: we refused before Lookup.
+	if got := helper.count("lookup"); got != 0 {
+		t.Errorf("expected 0 lookups when TLS-off blocks the cross-host retry, got %d", got)
+	}
+	if got := helper.count("approve") + helper.count("reject"); got != 0 {
+		t.Errorf("expected 0 approve/reject calls (nothing was attached), got %d", got)
+	}
+
+	// And no authenticated request ever reached the challenger.
+	for i, c := range calls {
+		if c.auth != "" {
+			t.Errorf("call %d to %s carried an Authorization header — creds leaked despite the gate: %+v", i, c.host, c)
+		}
+	}
+
+	// c.EndpointURL must not be adopted either.
+	if conn.EndpointURL.Host != testOriginHost {
+		t.Errorf("EndpointURL must stay on the user-configured host when TLS-off blocks adoption, got %q", conn.EndpointURL.Host)
+	}
+}
+
+// TestRequestInfoRefs_SameHostUnauthorizedWithSkipTLSVerifyStillRetries:
+// the gate is targeted, not blanket. A 401 from the *same* host the user
+// pointed at carries no MITM-via-redirect risk — the user already accepted
+// that host when they configured the sync — so the helper retry still
+// runs as normal even with TLS verification off.
+func TestRequestInfoRefs_SameHostUnauthorizedWithSkipTLSVerifyStillRetries(t *testing.T) {
+	helper := &fakeCredentialHelper{user: "alice", pass: "s3cret", ok: true}
+	attempts := 0
+	conn := newTestConn(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return newUnauthorizedResponse(req), nil
+		}
+		return newAdvertisementResponse(req), nil
+	}))
+	conn.CredentialHelper = helper
+	conn.InsecureSkipTLSVerify = true
+
+	if _, err := conn.RequestInfoRefs(context.Background(), "git-upload-pack", ""); err != nil {
+		t.Fatalf("RequestInfoRefs: %v", err)
+	}
+	if got := helper.count("approve"); got != 1 {
+		t.Errorf("expected 1 approve on a successful same-host retry even with TLS-off, got %d", got)
 	}
 }
 
@@ -1070,7 +1160,7 @@ func TestEnsureAuthForService_CrossHostProbeLooksUpAndAdoptsChallenger(t *testin
 	helper := &fakeCredentialHelper{user: "alice", pass: "s3cret", ok: true}
 	conn := newTestConn(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		switch req.URL.Host {
-		case "example.com":
+		case testOriginHost:
 			res := &http.Response{
 				StatusCode: http.StatusTemporaryRedirect,
 				Request:    req,
@@ -1099,6 +1189,45 @@ func TestEnsureAuthForService_CrossHostProbeLooksUpAndAdoptsChallenger(t *testin
 	}
 	if conn.EndpointURL.Host != testReplicaHost {
 		t.Errorf("expected EndpointURL to adopt replica.example after cross-host 401, got %q", conn.EndpointURL.Host)
+	}
+}
+
+// TestEnsureAuthForService_CrossHostProbeWithSkipTLSVerifyDoesNotAttach
+// is the EnsureAuthForService variant of the SkipTLSVerify safety gate:
+// the probe is allowed to follow the redirect (it's anonymous, no creds
+// at risk), but once we see the cross-host 401 we refuse to query the
+// helper or attach anything. The next real op surfaces the 401 cleanly.
+func TestEnsureAuthForService_CrossHostProbeWithSkipTLSVerifyDoesNotAttach(t *testing.T) {
+	helper := &fakeCredentialHelper{user: "alice", pass: "s3cret", ok: true}
+	conn := newTestConn(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Host {
+		case testOriginHost:
+			res := &http.Response{
+				StatusCode: http.StatusTemporaryRedirect,
+				Request:    req,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("")),
+			}
+			res.Header.Set("Location", "https://"+testReplicaHost+"/repo.git/git-receive-pack")
+			return res, nil
+		case testReplicaHost:
+			return newUnauthorizedResponse(req), nil
+		}
+		return nil, fmt.Errorf("unexpected host %s", req.URL.Host)
+	}))
+	conn.CredentialHelper = helper
+	conn.InsecureSkipTLSVerify = true
+
+	conn.EnsureAuthForService(context.Background(), "git-receive-pack")
+
+	if conn.Auth != nil {
+		t.Error("expected no auth to attach after a cross-host probe with TLS verification off")
+	}
+	if got := helper.count("lookup"); got != 0 {
+		t.Errorf("expected 0 lookups (gate runs before Lookup), got %d", got)
+	}
+	if conn.EndpointURL.Host != testOriginHost {
+		t.Errorf("EndpointURL must not be adopted to %q with TLS-off; got %q", testReplicaHost, conn.EndpointURL.Host)
 	}
 }
 
