@@ -607,20 +607,50 @@ func TestGitCredentialHelper_ApproveRejectSwallowHelperErrors(t *testing.T) {
 	GitCredentialHelper{}.Reject(context.Background(), ep, "u", "p")
 }
 
-// TestGitCredentialCmdDisablesTerminalPrompt is a regression test for issue
-// #63 — without GIT_TERMINAL_PROMPT=0 git drops into an interactive prompt.
-func TestGitCredentialCmdDisablesTerminalPrompt(t *testing.T) {
+// TestGitCredentialCmdInheritsEnvWithoutOverridingTerminalPrompt locks in
+// the corrected behaviour from issue #63: the proactive-Lookup path is what
+// caused the original spurious prompt on a public repo (already fixed by
+// deferring Lookup to a real 401), and we deliberately do NOT also force
+// GIT_TERMINAL_PROMPT=0. Forcing it would block legitimate first-time
+// authentication to a new host. Non-interactive callers (CI, daemons) set
+// the env var in their own environment, and we inherit it as-is.
+func TestGitCredentialCmdInheritsEnvWithoutOverridingTerminalPrompt(t *testing.T) {
+	// When the parent process has no GIT_TERMINAL_PROMPT set, the
+	// subprocess must not have one either — letting git's default
+	// (prompting allowed) take effect.
+	t.Setenv("GIT_TERMINAL_PROMPT", "")
+	os.Unsetenv("GIT_TERMINAL_PROMPT")
 	cmd := newGitCredentialCmd(context.Background(), CredentialOpFill, "protocol=https\nhost=example.com\n\n")
-
-	var found bool
+	// cmd.Env == nil means "inherit from parent" — equivalent to no override.
+	// If the implementation sets cmd.Env explicitly we still want no
+	// GIT_TERMINAL_PROMPT entry.
 	for _, kv := range cmd.Env {
-		if kv == "GIT_TERMINAL_PROMPT=0" {
-			found = true
-			break
+		if strings.HasPrefix(kv, "GIT_TERMINAL_PROMPT=") {
+			t.Errorf("subprocess must not force GIT_TERMINAL_PROMPT; got %q", kv)
 		}
 	}
-	if !found {
-		t.Errorf("expected GIT_TERMINAL_PROMPT=0 in cmd.Env, got %v", cmd.Env)
+
+	// When the parent sets GIT_TERMINAL_PROMPT=0 (non-interactive callers),
+	// the subprocess sees the same value — we pass it through, we don't
+	// override or strip it.
+	t.Setenv("GIT_TERMINAL_PROMPT", "0")
+	cmd = newGitCredentialCmd(context.Background(), CredentialOpFill, "protocol=https\nhost=example.com\n\n")
+	// cmd.Env == nil also satisfies this case (subprocess inherits the
+	// parent env including the value we just Setenv'd). If cmd.Env is
+	// populated, it must contain exactly the parent value.
+	if cmd.Env != nil {
+		var found, count int
+		for _, kv := range cmd.Env {
+			if strings.HasPrefix(kv, "GIT_TERMINAL_PROMPT=") {
+				count++
+				if kv == "GIT_TERMINAL_PROMPT=0" {
+					found++
+				}
+			}
+		}
+		if count != 1 || found != 1 {
+			t.Errorf("expected exactly one GIT_TERMINAL_PROMPT=0 entry passed through, got %d total / %d matching: %v", count, found, cmd.Env)
+		}
 	}
 }
 

@@ -180,8 +180,14 @@ type AuthMethod interface {
 }
 
 // CredentialHelper provides on-demand credentials when an HTTP request is
-// rejected with 401. Lookup must not block on user interaction — return
-// ok=false instead, so the sync can surface a clean 401 rather than hang.
+// rejected with 401. Lookup may block on user interaction if the underlying
+// helper falls through to a terminal prompt — that's vanilla git's
+// behaviour and intentional for interactive users. Callers that must not
+// block (CI, daemons, the syncer's background loop) set
+// GIT_TERMINAL_PROMPT=0 in their environment, which the credential
+// subprocess inherits. Lookup returns ok=false when no credentials could
+// be obtained, so the caller can surface a clean 401.
+//
 // Approve/Reject are advisory and intentionally have no error return:
 // failures must not poison the outer request flow.
 type CredentialHelper interface {

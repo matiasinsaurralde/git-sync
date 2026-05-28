@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"os"
 	"os/exec"
 	"strings"
 
@@ -72,13 +71,20 @@ const (
 
 // newGitCredentialCmd builds the `git credential <op>` invocation. Extracted
 // so tests can inspect the command's environment without exec'ing git.
+//
+// We inherit the parent environment unchanged — in particular, we do NOT
+// force GIT_TERMINAL_PROMPT=0. The original #63 symptom (interactive prompt
+// on a public-and-anonymous repo) is already prevented by Resolve no longer
+// invoking the helper proactively: with no 401 there's no Lookup, no
+// `git credential fill`, and so no prompt. Once the server actually
+// challenges with a 401, prompting is the right behaviour when there's a
+// terminal and a helper that has no entry for the host yet — same as
+// vanilla `git push`. Non-interactive callers (CI, daemons, the syncer
+// background loop) set GIT_TERMINAL_PROMPT=0 in their own environment the
+// same way they would for plain git, and we pass that through.
 func newGitCredentialCmd(ctx context.Context, op CredentialOp, input string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "git", "credential", string(op))
 	cmd.Stdin = strings.NewReader(input)
-	// Suppress git's interactive username/password fallback. Without this,
-	// a host with no configured helper drops to a /dev/tty prompt and turns
-	// git-sync into an interactive command (issue #63).
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	return cmd
 }
 
@@ -95,9 +101,15 @@ type GitCredentialHelper struct{}
 
 // Lookup queries the git credential helper for credentials for ep. Returns
 // ok=false if no credentials are available so the caller can surface a
-// clean 401 rather than block. A non-nil error means the lookup itself
-// couldn't complete (e.g. the context was cancelled) and the caller should
-// surface that rather than fall back to the original 401.
+// clean 401. A non-nil error means the lookup itself couldn't complete
+// (e.g. the context was cancelled) and the caller should surface that
+// rather than fall back to the original 401.
+//
+// Lookup may block on user interaction when the helper falls through to a
+// terminal prompt (vanilla `git credential fill` behaviour). Callers that
+// must not block should set GIT_TERMINAL_PROMPT=0 in the process
+// environment; the credential subprocess inherits it. See
+// newGitCredentialCmd for the rationale on not forcing that ourselves.
 func (GitCredentialHelper) Lookup(ctx context.Context, ep *url.URL) (username, password string, ok bool, err error) {
 	if !isHTTPEndpoint(ep) {
 		return "", "", false, nil
