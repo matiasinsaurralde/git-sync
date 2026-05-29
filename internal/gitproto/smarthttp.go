@@ -781,6 +781,15 @@ func (c *HTTPConn) adoptChallengeHost(challengeURL *url.URL) {
 // one would query (and possibly approve/reject) credentials under the
 // wrong helper key. The original repo path is preserved so the key still
 // matches what the user configured.
+//
+// We deliberately key on orig.Path rather than res.Request.URL.Path so
+// credentials the user stored against the URL they typed remain findable
+// when a redirect rewrites paths (e.g. github.com/owner/repo redirected
+// to cdn.example/mirror/owner/repo). Trade-off: for path-aware helpers
+// (credential.useHttpPath=true) the Approve/Reject key may be less
+// precise than the actual challenge URL. Not a credential leak — creds
+// only ever reach hosts the user already trusted enough to store them
+// against — just a helper-audit-trail imprecision.
 func challengeURLFor(orig *url.URL, res *http.Response) *url.URL {
 	if res == nil || res.Request == nil || res.Request.URL == nil {
 		return orig
