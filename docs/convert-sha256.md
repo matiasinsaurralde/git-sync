@@ -21,10 +21,12 @@ repository with `extensions.objectformat = sha256` and a
 `refs/notes/sha1-origin` ref recording each commit's pre-conversion SHA1.
 
 Scope is fixed: every branch and every tag on the source is always
-converted. Pass `--all-refs` to also include `refs/notes/*`,
-`refs/pull/*`, and other custom namespaces; pair with
-`--exclude-ref-prefix` to subtract specific namespaces (e.g.
-`--exclude-ref-prefix refs/pull/` on GitHub mirrors).
+converted. Pass `--all-refs` to also include `refs/notes/*` and other
+custom namespaces; pair with `--exclude-ref-prefix` to subtract specific
+namespaces. Server-internal pull/merge-request refs (`refs/pull/*`,
+`refs/pull-requests/*`, `refs/merge-requests/*`) are excluded even under
+`--all-refs` — see [Sharp Edges](#sharp-edges). Pass `--include-pull-refs`
+to convert them anyway.
 
 For a private source, pass the token via the environment so it isn't
 exposed in `ps`:
@@ -176,8 +178,12 @@ identity is set up.
 --target-dir                       SHA256 bare repo directory (must be empty)
 
 --all-refs                         also include refs/* outside heads/tags
-                                   (notes, pulls, custom namespaces)
+                                   (notes, custom namespaces; excludes
+                                   pull/merge-request refs by default)
 --exclude-ref-prefix               subtract refs by prefix; repeatable
+--include-pull-refs                with --all-refs, also convert
+                                   refs/pull/*, refs/pull-requests/*,
+                                   refs/merge-requests/* (off by default)
 
 --protocol                         protocol mode (auto, v1, v2)
 --write-mapping                    write SHA1 → SHA256 TSV to this path
@@ -227,6 +233,18 @@ doesn't match under SHA256 and the replacement never triggers.
 encode the target object's hash as the entry name, so notes survive
 as data but no longer attach to their original commits. Use the
 tool's own `refs/notes/sha1-origin` for the inverse lookup.
+
+**Foreign pull/merge-request refs are excluded by default.** Even under
+`--all-refs`, the command skips `refs/pull/*` (GitHub/Gitea/Forgejo),
+`refs/pull-requests/*` (Bitbucket), and `refs/merge-requests/*` (GitLab).
+These server-internal namespaces hold code proposed from forks and other
+branches — content foreign to the repository's own history until it is
+reviewed and merged. The converted repo is typically mirrored onward with
+`git push --mirror`, and a destination forge may not treat those
+namespaces as read-only PR refs; it can surface them as ordinary refs and
+thereby republish unreviewed code as if it were part of the repository.
+The run prints how many such refs it dropped. Pass `--include-pull-refs`
+to convert them anyway (e.g. for a faithful archival mirror you control).
 
 ## Operational Notes
 

@@ -25,11 +25,16 @@ re-hashed under SHA256 and tree/commit/tag references are rewritten.
 
 All branches and tags on the source are always converted — partial scope
 risks stranding cross-branch references in commit messages. Pass
---all-refs to also include refs/notes/*, refs/pull/*, and other custom
-namespaces; pass --exclude-ref-prefix to subtract specific namespaces
-from --all-refs. Exclude prefixes that would drop any branch or tag
-(e.g. refs/heads/feature/, refs/tags/, refs/) are rejected at run time
-to preserve the always-convert invariant.
+--all-refs to also include refs/notes/* and other custom namespaces;
+pass --exclude-ref-prefix to subtract specific namespaces from --all-refs.
+Exclude prefixes that would drop any branch or tag (e.g. refs/heads/feature/,
+refs/tags/, refs/) are rejected at run time to preserve the always-convert
+invariant.
+
+Server-internal pull/merge-request refs (refs/pull/*, refs/pull-requests/*,
+refs/merge-requests/*) are NOT converted even under --all-refs: they hold
+unmerged code foreign to the repository, and mirroring the result onward
+would republish it. Pass --include-pull-refs to convert them anyway.
 
 The conversion is destructive in two ways the caller should be aware of:
 GPG signatures on commits and tags are dropped (they sign over the
@@ -82,6 +87,8 @@ submodule repository first and re-point .gitmodules.`,
 
 	allRefsFlag(cmd, allRefsUsageScopeOnly, &req.AllRefs)
 	excludeRefPrefixFlag(cmd, &req.ExcludeRefPrefixes)
+	cmd.Flags().BoolVar(&req.IncludePullRefs, "include-pull-refs", false,
+		"with --all-refs, also convert server-internal pull/merge-request refs (refs/pull/*, refs/pull-requests/*, refs/merge-requests/*); off by default because they hold unmerged foreign code")
 	addProtocolFlag(cmd, &protocolVal)
 	cmd.Flags().BoolVarP(&req.Verbose, "verbose", "v", false, "verbose logging")
 	cmd.Flags().BoolVar(&req.Progress, "progress", false,

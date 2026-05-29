@@ -955,6 +955,80 @@ func TestRun_GitHTTPBackend_Sign(t *testing.T) {
 	}
 }
 
+// TestRun_GitHTTPBackend_PullRefs verifies that --all-refs excludes
+// pull/merge-request namespaces by default — including the foreign commit
+// that only a pull ref makes reachable — and that --include-pull-refs opts
+// back in.
+func TestRun_GitHTTPBackend_PullRefs(t *testing.T) {
+	if os.Getenv(gitHTTPBackendEnv) == "" {
+		t.Skipf("set %s=1 to run the convert-sha256 git-http-backend integration test", gitHTTPBackendEnv)
+	}
+	gitBin, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("git binary not available: %v", err)
+	}
+
+	root := t.TempDir()
+	srcBare := filepath.Join(root, "source.git")
+	worktree := filepath.Join(root, "work")
+
+	mustGit(t, root, "init", "--bare", srcBare)
+	mustGit(t, root, "init", "-b", "main", worktree)
+	mustGit(t, worktree, "config", "user.name", "convert-sha256 test")
+	mustGit(t, worktree, "config", "user.email", "test@example.com")
+	mustWrite(t, filepath.Join(worktree, "README"), "hello\n")
+	mustGit(t, worktree, "add", "README")
+	mustGit(t, worktree, "commit", "-m", "initial")
+	mustGit(t, worktree, "remote", "add", "origin", srcBare)
+	mustGit(t, worktree, "push", "origin", "HEAD:refs/heads/main")
+	// A server-internal PR ref whose tip is foreign: the commit is on no
+	// branch, so only refs/pull/1/head makes it reachable.
+	mustWrite(t, filepath.Join(worktree, "evil.txt"), "foreign\n")
+	mustGit(t, worktree, "add", "evil.txt")
+	mustGit(t, worktree, "commit", "-m", "foreign PR commit")
+	mustGit(t, worktree, "push", "origin", "HEAD:refs/pull/1/head")
+
+	srv := newCGIBackend(t, gitBin, root)
+	defer srv.Close()
+
+	// Default: --all-refs must drop refs/pull/* and report the count.
+	defaultDir := filepath.Join(root, "default.git")
+	res, err := Run(context.Background(), Request{
+		SourceURL: srv.URL + "/source.git",
+		TargetDir: defaultDir,
+		AllRefs:   true,
+		Out:       io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("convert (default): %v", err)
+	}
+	if res.SkippedPullRefs != 1 {
+		t.Errorf("SkippedPullRefs (default): got %d, want 1", res.SkippedPullRefs)
+	}
+	if refs := mustGitOutput(t, defaultDir, "for-each-ref", "--format=%(refname)"); strings.Contains(refs, "refs/pull/") {
+		t.Errorf("default --all-refs conversion leaked a pull ref:\n%s", refs)
+	}
+
+	// Opt-in: --include-pull-refs converts refs/pull/* and the foreign tip.
+	inclDir := filepath.Join(root, "incl.git")
+	res2, err := Run(context.Background(), Request{
+		SourceURL:       srv.URL + "/source.git",
+		TargetDir:       inclDir,
+		AllRefs:         true,
+		IncludePullRefs: true,
+		Out:             io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("convert (include): %v", err)
+	}
+	if res2.SkippedPullRefs != 0 {
+		t.Errorf("SkippedPullRefs (--include-pull-refs): got %d, want 0", res2.SkippedPullRefs)
+	}
+	if refs := mustGitOutput(t, inclDir, "for-each-ref", "--format=%(refname)"); !strings.Contains(refs, "refs/pull/1/head") {
+		t.Errorf("--include-pull-refs did not convert the pull ref:\n%s", refs)
+	}
+}
+
 func mustGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.CommandContext(t.Context(), "git", args...)
@@ -1067,6 +1141,60 @@ func TestRedactSourceURL(t *testing.T) {
 				t.Errorf("redactSourceURL(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestEffectiveExcludePrefixes(t *testing.T) {
+	user := []string{"refs/changes/"}
+	tests := []struct {
+		name             string
+		allRefs          bool
+		includePullRefs  bool
+		wantPullExcluded bool
+	}{
+		{"without --all-refs the pull namespaces are not added", false, false, false},
+		{"--all-refs excludes pull namespaces by default", true, false, true},
+		{"--all-refs --include-pull-refs keeps them in scope", true, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := effectiveExcludePrefixes(user, tt.allRefs, tt.includePullRefs)
+			// The user's own prefixes are always preserved.
+			if len(got) == 0 || got[0] != "refs/changes/" {
+				t.Fatalf("user prefixes not preserved: %v", got)
+			}
+			hasPull := false
+			for _, p := range got {
+				if p == "refs/pull/" {
+					hasPull = true
+				}
+			}
+			if hasPull != tt.wantPullExcluded {
+				t.Errorf("refs/pull/ excluded = %v, want %v (got %v)", hasPull, tt.wantPullExcluded, got)
+			}
+		})
+	}
+}
+
+func TestCountForeignPullRefs(t *testing.T) {
+	refs := map[plumbing.ReferenceName]plumbing.Hash{
+		"refs/heads/main":            plumbing.NewHash("aaaa000000000000000000000000000000000001"),
+		"refs/pull/1/head":           plumbing.NewHash("aaaa000000000000000000000000000000000002"),
+		"refs/pull/2/head":           plumbing.NewHash("aaaa000000000000000000000000000000000003"),
+		"refs/merge-requests/9/head": plumbing.NewHash("aaaa000000000000000000000000000000000004"),
+		"refs/pull-requests/5/from":  plumbing.NewHash("aaaa000000000000000000000000000000000005"),
+		"refs/tags/v1":               plumbing.NewHash("aaaa000000000000000000000000000000000006"),
+	}
+	if got, want := countForeignPullRefs(refs), 4; got != want {
+		t.Errorf("countForeignPullRefs = %d, want %d", got, want)
+	}
+}
+
+// The default pull-ref exclusions must never trip the branch/tag
+// protection guard — they live outside refs/heads/ and refs/tags/.
+func TestForeignPullRefPrefixes_NotProtected(t *testing.T) {
+	if bad := protectedExcludePrefixes(foreignPullRefPrefixes); len(bad) != 0 {
+		t.Errorf("foreign pull-ref prefixes rejected by protectedExcludePrefixes: %v", bad)
 	}
 }
 

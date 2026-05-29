@@ -53,8 +53,10 @@ import (
 // Scope is intentionally fixed: every branch and every annotated/lightweight
 // tag on the source is always converted. Partial scope risks stranding
 // cross-branch references in commit messages, which defeats the point of a
-// one-off cutover. AllRefs additionally pulls in refs/notes, refs/pull, and
-// other custom namespaces; ExcludeRefPrefixes subtracts from that.
+// one-off cutover. AllRefs additionally pulls in refs/notes and other custom
+// namespaces; ExcludeRefPrefixes subtracts from that. Server-internal
+// pull/merge-request namespaces are excluded from AllRefs by default (see
+// IncludePullRefs) because they carry unmerged foreign code.
 type Request struct {
 	SourceURL                    string
 	SourceAuth                   gitsync.EndpointAuth
@@ -63,6 +65,17 @@ type Request struct {
 
 	AllRefs            bool
 	ExcludeRefPrefixes []string
+
+	// IncludePullRefs opts back into converting the server-internal
+	// pull/merge-request namespaces (refs/pull/*, refs/pull-requests/*,
+	// refs/merge-requests/*) that AllRefs would otherwise pull in. They
+	// are excluded by default: those refs hold code proposed from forks
+	// and other branches — foreign to the repository until merged — and
+	// the converted repo is typically mirrored onward with
+	// `git push --mirror`, where a destination forge may surface them as
+	// ordinary refs and republish unreviewed code as repo content. No
+	// effect without AllRefs (the namespaces are out of scope anyway).
+	IncludePullRefs bool
 
 	ProtocolMode gitsync.ProtocolMode
 	Verbose      bool
@@ -117,6 +130,7 @@ type Result struct {
 	SignaturesStripped   int      `json:"signaturesStripped"`
 	MessageRewrites      int      `json:"messageRewrites"`
 	AmbiguousMessageRefs []string `json:"ambiguousMessageRefs,omitempty"`
+	SkippedPullRefs      int      `json:"skippedPullRefs,omitempty"`
 	OriginNotesRef       string   `json:"originNotesRef,omitempty"`
 	MappingFile          string   `json:"mappingFile,omitempty"`
 	SignedTags           []string `json:"signedTags,omitempty"`
@@ -175,6 +189,9 @@ func (r Result) Lines() []string {
 			line += fmt.Sprintf(", ... (%d more)", extra)
 		}
 		lines = append(lines, line)
+	}
+	if r.SkippedPullRefs > 0 {
+		lines = append(lines, fmt.Sprintf("excluded %d foreign pull/merge-request ref(s) (refs/pull/*, refs/pull-requests/*, refs/merge-requests/*) from --all-refs; pass --include-pull-refs to convert them", r.SkippedPullRefs))
 	}
 	if r.OriginNotesRef != "" {
 		lines = append(lines, fmt.Sprintf("origin notes ref: %s (use `git notes --ref=%s show <sha256>` to recover old SHA1)",
@@ -285,12 +302,13 @@ func Run(ctx context.Context, req Request) (Result, error) {
 
 	// Source connection + ref discovery -----------------------------------
 	// Scope is fixed: always include every branch and every tag. AllRefs
-	// extends to refs/notes/*, refs/pull/*, and other namespaces;
-	// ExcludeRefPrefixes can subtract from that under AllRefs.
+	// extends to refs/notes/* and other namespaces; ExcludeRefPrefixes
+	// can subtract from that under AllRefs. Pull/merge-request namespaces
+	// are excluded by default (foreign code) unless --include-pull-refs.
 	planCfg := planner.PlanConfig{
 		IncludeTags:        true,
 		AllRefs:            req.AllRefs,
-		ExcludeRefPrefixes: append([]string(nil), req.ExcludeRefPrefixes...),
+		ExcludeRefPrefixes: effectiveExcludePrefixes(req.ExcludeRefPrefixes, req.AllRefs, req.IncludePullRefs),
 	}
 	conn, refService, sourceRefList, err := openSource(ctx, req, planCfg)
 	if err != nil {
@@ -306,6 +324,16 @@ func Run(ctx context.Context, req Request) (Result, error) {
 	}
 	if len(desired) == 0 {
 		return res, errors.New("no source refs matched the requested scope")
+	}
+
+	// Surface how many pull/merge-request refs the default exclusion
+	// dropped, so an --all-refs run doesn't silently omit them. Only
+	// meaningful when we actually excluded them.
+	if req.AllRefs && !req.IncludePullRefs {
+		if skipped := countForeignPullRefs(sourceRefs); skipped > 0 {
+			res.SkippedPullRefs = skipped
+			fmt.Fprintf(out, "excluding %d foreign pull/merge-request ref(s) from --all-refs (pass --include-pull-refs to convert them) ...\n", skipped)
+		}
 	}
 
 	// Refuse before any further I/O if the source carries refs that
@@ -717,6 +745,48 @@ const (
 	SignModeNone = "none"
 	SignModeTips = "tips"
 )
+
+// foreignPullRefPrefixes are the server-internal pull/merge-request
+// namespaces that hold code proposed from forks and other branches —
+// content foreign to the repository's own history until merged. They are
+// excluded from --all-refs by default: the converted repo is usually
+// mirrored onward with `git push --mirror`, and a destination forge may
+// surface these refs as ordinary refs, republishing unreviewed code as if
+// it were part of the repo. --include-pull-refs opts back in.
+var foreignPullRefPrefixes = []string{
+	"refs/pull/",           // GitHub, Gitea, Forgejo
+	"refs/pull-requests/",  // Bitbucket Server / Data Center
+	"refs/merge-requests/", // GitLab
+}
+
+// effectiveExcludePrefixes combines the user's --exclude-ref-prefix values
+// with the default pull/merge-request exclusions. The latter only apply
+// under --all-refs (the namespaces are out of scope otherwise) and only
+// when the user did not pass --include-pull-refs.
+func effectiveExcludePrefixes(userPrefixes []string, allRefs, includePullRefs bool) []string {
+	out := append([]string(nil), userPrefixes...)
+	if allRefs && !includePullRefs {
+		out = append(out, foreignPullRefPrefixes...)
+	}
+	return out
+}
+
+// countForeignPullRefs reports how many source refs fall under a
+// pull/merge-request namespace, so the run can tell the user exactly how
+// many refs the default exclusion dropped rather than silently omitting
+// them from an --all-refs conversion.
+func countForeignPullRefs(refs map[plumbing.ReferenceName]plumbing.Hash) int {
+	n := 0
+	for name := range refs {
+		for _, p := range foreignPullRefPrefixes {
+			if strings.HasPrefix(string(name), p) {
+				n++
+				break
+			}
+		}
+	}
+	return n
+}
 
 // protectedExcludePrefixes returns the subset of prefixes that, under
 // planner.IsRefExcluded's string-prefix semantics, would knock out at
