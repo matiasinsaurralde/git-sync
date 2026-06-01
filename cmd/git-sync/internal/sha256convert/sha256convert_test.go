@@ -1263,6 +1263,92 @@ func TestCountForeignPullRefs(t *testing.T) {
 	}
 }
 
+// TestEnsureEmptyTarget covers the three cases the failure-cleanup logic
+// depends on: an absent directory is created (created=true), a
+// pre-existing empty directory is accepted without claiming creation
+// (created=false), and a non-empty directory is refused.
+func TestEnsureEmptyTarget(t *testing.T) {
+	t.Run("absent dir is created", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "out")
+		created, err := ensureEmptyTarget(path)
+		if err != nil {
+			t.Fatalf("ensureEmptyTarget: %v", err)
+		}
+		if !created {
+			t.Errorf("created = false, want true for an absent directory")
+		}
+		if info, statErr := os.Stat(path); statErr != nil || !info.IsDir() {
+			t.Errorf("expected %s to be created as a directory; stat err=%v", path, statErr)
+		}
+	})
+
+	t.Run("pre-existing empty dir is accepted, not claimed as created", func(t *testing.T) {
+		path := t.TempDir() // already exists and is empty
+		created, err := ensureEmptyTarget(path)
+		if err != nil {
+			t.Fatalf("ensureEmptyTarget: %v", err)
+		}
+		if created {
+			t.Errorf("created = true, want false for a pre-existing directory")
+		}
+	})
+
+	t.Run("non-empty dir is refused", func(t *testing.T) {
+		path := t.TempDir()
+		if err := os.WriteFile(filepath.Join(path, "f"), []byte("x"), 0o644); err != nil {
+			t.Fatalf("seed file: %v", err)
+		}
+		if _, err := ensureEmptyTarget(path); err == nil {
+			t.Errorf("expected refusal of a non-empty directory, got nil")
+		}
+	})
+}
+
+// TestCleanupConvertedTarget locks in the invariant the failure path
+// claims: a directory the run created is removed outright, but a
+// directory the user pre-created is restored to empty — never deleted —
+// so a mountpoint or a dir with user-set ownership/ACLs survives a failed
+// conversion.
+func TestCleanupConvertedTarget(t *testing.T) {
+	t.Run("run-created dir is removed outright", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "out")
+		if err := os.MkdirAll(filepath.Join(path, "objects"), 0o755); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		if err := cleanupConvertedTarget(path, true); err != nil {
+			t.Fatalf("cleanupConvertedTarget: %v", err)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("expected %s to be removed; stat err=%v", path, err)
+		}
+	})
+
+	t.Run("pre-existing dir is emptied but kept", func(t *testing.T) {
+		path := t.TempDir()
+		// Mimic a half-written bare repo: nested dirs plus a top-level file.
+		if err := os.MkdirAll(filepath.Join(path, "objects", "pack"), 0o755); err != nil {
+			t.Fatalf("seed dirs: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "HEAD"), []byte("ref: x\n"), 0o644); err != nil {
+			t.Fatalf("seed file: %v", err)
+		}
+		if err := cleanupConvertedTarget(path, false); err != nil {
+			t.Fatalf("cleanupConvertedTarget: %v", err)
+		}
+		info, err := os.Stat(path)
+		if err != nil || !info.IsDir() {
+			t.Fatalf("pre-existing directory must survive cleanup; stat err=%v", err)
+		}
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			t.Fatalf("read dir: %v", err)
+		}
+		if len(entries) != 0 {
+			t.Errorf("directory should be empty after cleanup, got %d entries", len(entries))
+		}
+	})
+}
+
 // The default pull-ref exclusions must never trip the branch/tag
 // protection guard — they live outside refs/heads/ and refs/tags/.
 func TestForeignPullRefPrefixes_NotProtected(t *testing.T) {

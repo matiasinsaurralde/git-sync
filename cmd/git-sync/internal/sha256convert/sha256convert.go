@@ -247,7 +247,8 @@ func Run(ctx context.Context, req Request) (Result, error) {
 		out = os.Stderr
 	}
 
-	if err := ensureEmptyTarget(req.TargetDir); err != nil {
+	targetCreated, err := ensureEmptyTarget(req.TargetDir)
+	if err != nil {
 		return Result{}, err
 	}
 
@@ -262,18 +263,20 @@ func Run(ctx context.Context, req Request) (Result, error) {
 		}
 	}()
 
-	// cleanupTarget fires when set, wiping the SHA256 bare repo we
-	// initialize below. ensureEmptyTarget already verified the dir was
-	// empty going in, so a defensive RemoveAll on failure only ever
-	// removes content this run created. Without it, any error after
-	// PlainInit leaves config/objects/refs/HEAD behind, and the next
-	// retry hits ensureEmptyTarget's "not empty" refusal with no
-	// indication of how to recover. Suppressed by --keep-source-objects
-	// so users can inspect partial state.
+	// cleanupTarget fires when set, undoing the SHA256 bare repo we
+	// initialize below. Without it, any error after PlainInit leaves
+	// config/objects/refs/HEAD behind, and the next retry hits
+	// ensureEmptyTarget's "not empty" refusal with no indication of how
+	// to recover. We restore the exact pre-run state: if this run created
+	// the target directory, remove it entirely; if the user pre-created it
+	// (empty — a mountpoint, or a dir whose ownership/ACLs they set up),
+	// remove only the entries we added and leave the directory in place.
+	// Suppressed by --keep-source-objects so users can inspect partial
+	// state.
 	cleanupTarget := false
 	defer func() {
 		if cleanupTarget && !req.KeepSourceObjects {
-			_ = os.RemoveAll(req.TargetDir)
+			_ = cleanupConvertedTarget(req.TargetDir, targetCreated)
 		}
 	}()
 
@@ -859,20 +862,51 @@ func checkSideOutputCollision(desired map[plumbing.ReferenceName]planner.Desired
 }
 
 // ensureEmptyTarget refuses to init into a non-empty directory so the user
-// doesn't quietly accumulate objects into an existing repo.
-func ensureEmptyTarget(path string) error {
+// doesn't quietly accumulate objects into an existing repo. It reports
+// created=true when it had to make the directory, so the caller's failure
+// cleanup can tell "remove the whole tree we created" apart from "remove
+// only the contents we added to a directory the user pre-created".
+func ensureEmptyTarget(path string) (created bool, err error) {
 	entries, err := os.ReadDir(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			if mkErr := os.MkdirAll(path, 0o755); mkErr != nil {
-				return fmt.Errorf("create target dir: %w", mkErr)
+				return false, fmt.Errorf("create target dir: %w", mkErr)
 			}
-			return nil
+			return true, nil
 		}
-		return fmt.Errorf("read target dir: %w", err)
+		return false, fmt.Errorf("read target dir: %w", err)
 	}
 	if len(entries) > 0 {
-		return fmt.Errorf("target directory %s is not empty", path)
+		return false, fmt.Errorf("target directory %s is not empty", path)
+	}
+	return false, nil
+}
+
+// cleanupConvertedTarget restores the target directory to the state it had
+// before the run, for use on a failure path. When the run created the
+// directory (created=true) it is removed outright. When the user
+// pre-created it — ensureEmptyTarget accepts an existing empty directory —
+// only the entries the run added are removed, leaving the directory and
+// any ownership, permissions, ACLs, or mount the user set up intact.
+func cleanupConvertedTarget(path string, created bool) error {
+	if created {
+		return os.RemoveAll(path)
+	}
+	return removeDirContents(path)
+}
+
+// removeDirContents removes every entry inside dir but leaves dir itself
+// in place.
+func removeDirContents(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			return err
+		}
 	}
 	return nil
 }
