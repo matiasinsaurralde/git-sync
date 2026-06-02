@@ -539,7 +539,6 @@ func (c *HTTPConn) doPostRPCRequest(ctx context.Context, service string, body io
 		dumpOutgoingRequest(req, "POST "+service)
 	}
 
-
 	res, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("post RPC: %w", err)
