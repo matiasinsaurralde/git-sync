@@ -377,6 +377,10 @@ func newConn(raw Endpoint, label string, stats *statsCollector, httpClient *http
 	client := instrumentHTTPClient(httpClient, raw.SkipTLSVerify, label, stats)
 	conn := gitproto.NewHTTPConnWithClient(ep, label, authMethod, client)
 	conn.FollowInfoRefsRedirect = raw.FollowInfoRefsRedirect
+	conn.InsecureSkipTLSVerify = raw.SkipTLSVerify
+	if authMethod == nil {
+		conn.CredentialHelper = auth.GitCredentialHelper{}
+	}
 	return conn, nil
 }
 
