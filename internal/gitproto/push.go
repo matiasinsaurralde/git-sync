@@ -129,8 +129,8 @@ func IsLeaseFailure(status string) bool {
 // annotateLeaseFailure wraps a lease-failure CommandStatusErr with a retry/
 // override hint. Other receive-pack errors pass through unchanged.
 func annotateLeaseFailure(err error) error {
-	var cs *packp.CommandStatusErr
-	if !errors.As(err, &cs) {
+	cs, ok := commandStatusErr(err)
+	if !ok {
 		return err
 	}
 	if !IsLeaseFailure(cs.Status) {
@@ -229,15 +229,37 @@ func isConcurrentMove(reason string) bool {
 	return false
 }
 
+// commandStatusErr extracts go-git's per-ref CommandStatusErr from err's chain.
+// errors.As is EXACT about value-vs-pointer, and the form go-git uses is not
+// part of its API contract: today report.Error() returns the error BY VALUE
+// (value receiver Error(), constructed by value in report_status.go), but go-git
+// is an alpha dependency and could switch to a *CommandStatusErr. A target that
+// only matches one form would silently stop classifying every rejection if the
+// other showed up — the exact failure a pointer-only target caused before. So we
+// try the value form first (the current reality) and fall back to the pointer
+// form. TestAsRefRejectedError_RealReportStatusPath drives go-git's real
+// report.Error() so a deeper type change still fails loud in CI.
+func commandStatusErr(err error) (packp.CommandStatusErr, bool) {
+	var byVal packp.CommandStatusErr
+	if errors.As(err, &byVal) {
+		return byVal, true
+	}
+	var byPtr *packp.CommandStatusErr
+	if errors.As(err, &byPtr) && byPtr != nil {
+		return *byPtr, true
+	}
+	return packp.CommandStatusErr{}, false
+}
+
 // asRefRejectedError wraps a target receive-pack report-status "ng" error in
 // a typed *RefRejectedError so callers can branch on errors.As /
 // errors.Is(err, ErrTargetRefMoved) instead of substring-matching the free-form
 // reason themselves. Inputs that are not a per-ref command status (e.g. an
 // unpack-status error) pass through unchanged. The input is preserved via Unwrap,
-// so the message and any errors.As(*packp.CommandStatusErr) check are unchanged.
+// so the message and the underlying packp.CommandStatusErr stay reachable.
 func asRefRejectedError(err error) error {
-	var cs *packp.CommandStatusErr
-	if !errors.As(err, &cs) {
+	cs, ok := commandStatusErr(err)
+	if !ok {
 		return err
 	}
 	return &RefRejectedError{
