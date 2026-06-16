@@ -500,8 +500,11 @@ func executeBatched( //nolint:maintidx // complex batch logic is inherently bran
 				_ = packReader.Close()
 				// Treat abortedEarly the same as a body-limit error:
 				// both indicate "this pack is too big for the target",
-				// just one is detected by the server and one by us.
-				sizeIssue := abortedEarly || isTargetBodyLimitError(pushErr)
+				// just one is detected by the server and one by us. A
+				// receive-pack deadline (408/504) lands here too — a
+				// checkpoint that times out is also too big for this
+				// target/link, and subdividing makes each push finish sooner.
+				sizeIssue := abortedEarly || isBatchableTargetPushError(pushErr)
 				p.log("bootstrap batch push failed",
 					"branch", batch.Plan.TargetRef.String(),
 					"batch", idx+1,
@@ -1378,7 +1381,7 @@ func GitHubOwnerRepo(conn gitproto.Conn) (string, string, bool) {
 }
 
 func autoTargetMaxPackBytes(p Params, err error) (int64, bool) {
-	if p.TargetMaxPack > 0 || !isTargetBodyLimitError(err) {
+	if p.TargetMaxPack > 0 || !isBatchableTargetPushError(err) {
 		return 0, false
 	}
 	if p.SourceService == nil || !p.SourceService.SupportsBootstrapBatch() {
@@ -1436,6 +1439,35 @@ func isTargetBodyLimitError(err error) bool {
 		(strings.Contains(msg, "request body") && strings.Contains(msg, "too large")) ||
 		(strings.Contains(msg, "payload") && strings.Contains(msg, "too large")) ||
 		strings.Contains(msg, "http 413")
+}
+
+// isTargetPushDeadlineError reports whether err indicates the target cut the
+// receive-pack POST short because it ran past a server-side deadline rather
+// than because the pack exceeded an announced size limit. GitHub returns 408
+// (Request Timeout) when a slow or oversized push outlasts its receive-pack
+// wall-clock window — common when relaying a large repo over a slow source
+// link, where the upstream read rate throttles the downstream write. Gateways
+// fronting other hosts surface the same condition as 504 (Gateway Timeout).
+//
+// Both are remedied the way a body-limit rejection is: smaller packs each
+// finish inside the window, so callers route them into the same batched
+// bootstrap retry. Kept distinct from isTargetBodyLimitError because the
+// trigger is a timeout, not a size rejection, and there's no body limit to
+// parse out of the message.
+func isTargetPushDeadlineError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "http 408") || strings.Contains(msg, "http 504")
+}
+
+// isBatchableTargetPushError reports whether err is a target-side push failure
+// that batched bootstrap can work around by sending smaller packs: an explicit
+// body-size rejection (413 / "body exceeded size limit") or a receive-pack
+// deadline (408 / 504).
+func isBatchableTargetPushError(err error) bool {
+	return isTargetBodyLimitError(err) || isTargetPushDeadlineError(err)
 }
 
 func targetBodyLimit(err error) int64 {

@@ -142,6 +142,72 @@ func TestIsTargetBodyLimitError(t *testing.T) {
 	}
 }
 
+func TestIsTargetPushDeadlineError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil error", err: nil, want: false},
+		{
+			name: "github receive-pack 408",
+			err:  errors.New("push target refs: target receive-pack: post RPC stream body: http 408: https://github.com/o/r.git/git-receive-pack"),
+			want: true,
+		},
+		{
+			name: "gateway 504",
+			err:  errors.New("target receive-pack: http 504: gateway timeout"),
+			want: true,
+		},
+		{
+			name: "body limit is not a deadline",
+			err:  errors.New("body exceeded size limit 1048576"),
+			want: false,
+		},
+		{
+			name: "413 is not a deadline",
+			err:  errors.New("http 413: payload too large"),
+			want: false,
+		},
+		{
+			name: "unrelated error",
+			err:  errors.New("connection refused"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isTargetPushDeadlineError(tt.err); got != tt.want {
+				t.Errorf("isTargetPushDeadlineError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsBatchableTargetPushError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil error", err: nil, want: false},
+		{name: "body limit", err: errors.New("body exceeded size limit 1048576"), want: true},
+		{name: "http 413", err: errors.New("http 413"), want: true},
+		{name: "http 408 deadline", err: errors.New("http 408: request timeout"), want: true},
+		{name: "http 504 deadline", err: errors.New("http 504: gateway timeout"), want: true},
+		{name: "unrelated", err: errors.New("connection refused"), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isBatchableTargetPushError(tt.err); got != tt.want {
+				t.Errorf("isBatchableTargetPushError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestTargetBodyLimit(t *testing.T) {
 	tests := []struct {
 		name string
