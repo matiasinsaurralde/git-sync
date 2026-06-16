@@ -179,12 +179,16 @@ func Execute(ctx context.Context, p Params, relayReason string) (Result, error) 
 	if pushErr != nil {
 		autoBatch, ok := autoTargetMaxPackBytes(p, pushErr)
 		if !ok {
-			return result, fmt.Errorf("push target refs: %w", pushErr)
+			return result, fmt.Errorf("push target refs: %w", actionableTargetPushError(p, pushErr))
 		}
-		p.log("bootstrap retrying with batched mode after target rejection",
-			"target_max_pack_bytes", autoBatch)
-		p.notice(fmt.Sprintf("target rejected pack — switching to batched mode (limit %s)",
-			humanBytes(autoBatch)))
+		reason := "target rejected pack"
+		if isTargetPushDeadlineError(pushErr) {
+			reason = "target push timed out"
+		}
+		p.log("bootstrap retrying with batched mode after batchable push failure",
+			"target_max_pack_bytes", autoBatch, "reason", reason)
+		p.notice(fmt.Sprintf("%s — switching to batched mode (limit %s)",
+			reason, humanBytes(autoBatch)))
 		p.TargetMaxPack = autoBatch
 		return executeBatched(ctx, p, plans, result)
 	}
@@ -498,10 +502,12 @@ func executeBatched( //nolint:maintidx // complex batch logic is inherently bran
 			abortedEarly := observer.Aborted()
 			if pushErr != nil {
 				_ = packReader.Close()
-				// Treat abortedEarly the same as a body-limit error:
-				// both indicate "this pack is too big for the target",
-				// just one is detected by the server and one by us.
-				sizeIssue := abortedEarly || isTargetBodyLimitError(pushErr)
+				// A pack too big for the target is the unifying signal here,
+				// whether the server announced it (413 body limit), we
+				// detected it ourselves (abortedEarly), or the target ran out
+				// of time receiving it (408/504 deadline). All three are fixed
+				// the same way: subdivide so each push is smaller and faster.
+				subdivide := abortedEarly || isBatchableTargetPushError(pushErr)
 				p.log("bootstrap batch push failed",
 					"branch", batch.Plan.TargetRef.String(),
 					"batch", idx+1,
@@ -513,9 +519,9 @@ func executeBatched( //nolint:maintidx // complex batch logic is inherently bran
 					"objects_sent", objectsSent,
 					"total_objects_in_pack", totalObjects,
 					"aborted_early", abortedEarly,
-					"will_subdivide", sizeIssue && len(batch.chain) > 0,
+					"will_subdivide", subdivide && len(batch.chain) > 0,
 					"error", pushErr.Error())
-				if sizeIssue && len(batch.chain) > 0 {
+				if subdivide && len(batch.chain) > 0 {
 					parsedLimit := targetBodyLimit(pushErr)
 					limit := p.TargetMaxPack
 					if parsedLimit > 0 {
@@ -1378,7 +1384,7 @@ func GitHubOwnerRepo(conn gitproto.Conn) (string, string, bool) {
 }
 
 func autoTargetMaxPackBytes(p Params, err error) (int64, bool) {
-	if p.TargetMaxPack > 0 || !isTargetBodyLimitError(err) {
+	if p.TargetMaxPack > 0 || !isBatchableTargetPushError(err) {
 		return 0, false
 	}
 	if p.SourceService == nil || !p.SourceService.SupportsBootstrapBatch() {
@@ -1436,6 +1442,54 @@ func isTargetBodyLimitError(err error) bool {
 		(strings.Contains(msg, "request body") && strings.Contains(msg, "too large")) ||
 		(strings.Contains(msg, "payload") && strings.Contains(msg, "too large")) ||
 		strings.Contains(msg, "http 413")
+}
+
+// isTargetPushDeadlineError reports whether err indicates the target cut the
+// receive-pack POST short because it ran past a server-side deadline rather
+// than because the pack exceeded an announced size limit. GitHub returns 408
+// (Request Timeout) when a slow or oversized push outlasts its receive-pack
+// wall-clock window — common when relaying a large repo over a slow source
+// link, where the upstream read rate throttles the downstream write. Gateways
+// fronting other hosts surface the same condition as 504 (Gateway Timeout).
+//
+// Both are remedied the way a body-limit rejection is: smaller packs each
+// finish inside the window, so callers route them into the same batched
+// bootstrap retry. Kept distinct from isTargetBodyLimitError because the
+// trigger is a timeout, not a size rejection, and there's no body limit to
+// parse out of the message.
+func isTargetPushDeadlineError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "http 408") || strings.Contains(msg, "http 504")
+}
+
+// isBatchableTargetPushError reports whether err is a target-side push failure
+// that batched bootstrap can work around by sending smaller packs: an explicit
+// body-size rejection (413 / "body exceeded size limit") or a receive-pack
+// deadline (408 / 504).
+func isBatchableTargetPushError(err error) bool {
+	return isTargetBodyLimitError(err) || isTargetPushDeadlineError(err)
+}
+
+// actionableTargetPushError augments a one-shot push failure with guidance
+// when the target couldn't receive the pack — too large or too slow — but batched
+// bootstrap couldn't take over — which, on the one-shot path, means the source
+// can't serve the protocol-v2 fetch filter that checkpointing requires. The
+// extra context tells the user why the obvious knob (--target-max-pack-bytes)
+// won't help here, instead of leaving a bare "http 408". Returns err unchanged
+// for non-batchable failures or when batching is in fact available.
+func actionableTargetPushError(p Params, err error) error {
+	if !isBatchableTargetPushError(err) {
+		return err
+	}
+	if p.SourceService != nil && p.SourceService.SupportsBootstrapBatch() {
+		return err
+	}
+	return fmt.Errorf("%w (target could not receive the pack — too large, or too slow to "+
+		"receive within its deadline; batched bootstrap could split it into smaller pushes, "+
+		"but the source does not support the protocol-v2 fetch filter batched bootstrap requires)", err)
 }
 
 func targetBodyLimit(err error) int64 {

@@ -142,6 +142,71 @@ func TestIsTargetBodyLimitError(t *testing.T) {
 	}
 }
 
+func TestIsTargetPushDeadlineError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil error", err: nil, want: false},
+		{
+			name: "github receive-pack 408",
+			err:  errors.New("push target refs: target receive-pack: post RPC stream body: http 408: https://github.com/o/r.git/git-receive-pack"),
+			want: true,
+		},
+		{
+			name: "gateway 504",
+			err:  errors.New("target receive-pack: http 504: gateway timeout"),
+			want: true,
+		},
+		{
+			name: "body limit is not a deadline",
+			err:  errors.New("body exceeded size limit 1048576"),
+			want: false,
+		},
+		{
+			name: "413 is not a deadline",
+			err:  errors.New("http 413: payload too large"),
+			want: false,
+		},
+		{
+			name: "unrelated error",
+			err:  errors.New("connection refused"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isTargetPushDeadlineError(tt.err); got != tt.want {
+				t.Errorf("isTargetPushDeadlineError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsBatchableTargetPushError(t *testing.T) {
+	// Per-status edge cases are covered by TestIsTargetBodyLimitError and
+	// TestIsTargetPushDeadlineError; this only confirms the OR wires both in.
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "body limit", err: errors.New("body exceeded size limit 1048576"), want: true},
+		{name: "deadline", err: errors.New("http 408: request timeout"), want: true},
+		{name: "unrelated", err: errors.New("connection refused"), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isBatchableTargetPushError(tt.err); got != tt.want {
+				t.Errorf("isBatchableTargetPushError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestTargetBodyLimit(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1427,6 +1492,57 @@ func TestExecuteOneShotClosesPackWhenPusherDoesNot(t *testing.T) {
 	}
 	if !pack.closed {
 		t.Fatal("expected strategy to close pack after successful push")
+	}
+}
+
+// noBatchSource is a source that can't serve the protocol-v2 fetch filter
+// batched bootstrap needs, so a one-shot push failure has no batched fallback.
+type noBatchSource struct{ fakeBootstrapSource }
+
+func (noBatchSource) SupportsBootstrapBatch() bool { return false }
+
+func TestAutoTargetMaxPackBytesTimeoutTriggersBatching(t *testing.T) {
+	limit, ok := autoTargetMaxPackBytes(
+		Params{SourceService: fakeBootstrapSource{}},
+		errors.New("target receive-pack: http 408: request timeout"),
+	)
+	if !ok {
+		t.Fatal("autoTargetMaxPackBytes(408) = not ok, want batched fallback")
+	}
+	if limit != defaultTargetMaxPackBytes {
+		t.Fatalf("limit = %d, want default %d", limit, int64(defaultTargetMaxPackBytes))
+	}
+}
+
+func TestExecuteOneShotTimeoutWithoutBatchSupportIsActionable(t *testing.T) {
+	mainRef := plumbing.NewBranchReferenceName("main")
+	mainHash := plumbing.NewHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	pushErr := errors.New("target receive-pack: post RPC stream body: http 408: request timeout")
+
+	_, err := Execute(context.Background(), Params{
+		SourceService: noBatchSource{fakeBootstrapSource{
+			fetchPack: func(_ context.Context, _ gitproto.Conn, _ map[plumbing.ReferenceName]gitproto.DesiredRef, _ map[plumbing.ReferenceName]plumbing.Hash) (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader([]byte("PACK"))), nil
+			},
+		}},
+		TargetPusher: fakeBootstrapPusher{
+			pushPack: func(_ context.Context, _ []gitproto.PushCommand, pack io.ReadCloser) error {
+				_ = pack.Close()
+				return pushErr
+			},
+		},
+		DesiredRefs: map[plumbing.ReferenceName]planner.DesiredRef{
+			mainRef: {SourceRef: mainRef, TargetRef: mainRef, SourceHash: mainHash, Kind: planner.RefKindBranch},
+		},
+	}, "empty target")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want actionable timeout error")
+	}
+	if !errors.Is(err, pushErr) {
+		t.Fatalf("Execute() error does not wrap original push error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "protocol-v2 fetch filter") {
+		t.Fatalf("Execute() error missing batched-bootstrap guidance: %v", err)
 	}
 }
 
