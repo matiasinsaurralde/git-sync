@@ -179,12 +179,16 @@ func Execute(ctx context.Context, p Params, relayReason string) (Result, error) 
 	if pushErr != nil {
 		autoBatch, ok := autoTargetMaxPackBytes(p, pushErr)
 		if !ok {
-			return result, fmt.Errorf("push target refs: %w", pushErr)
+			return result, fmt.Errorf("push target refs: %w", actionableTargetPushError(p, pushErr))
+		}
+		reason := "target rejected pack"
+		if isTargetPushDeadlineError(pushErr) {
+			reason = "target push timed out"
 		}
 		p.log("bootstrap retrying with batched mode after target rejection",
-			"target_max_pack_bytes", autoBatch)
-		p.notice(fmt.Sprintf("target rejected pack — switching to batched mode (limit %s)",
-			humanBytes(autoBatch)))
+			"target_max_pack_bytes", autoBatch, "reason", reason)
+		p.notice(fmt.Sprintf("%s — switching to batched mode (limit %s)",
+			reason, humanBytes(autoBatch)))
 		p.TargetMaxPack = autoBatch
 		return executeBatched(ctx, p, plans, result)
 	}
@@ -1468,6 +1472,25 @@ func isTargetPushDeadlineError(err error) bool {
 // deadline (408 / 504).
 func isBatchableTargetPushError(err error) bool {
 	return isTargetBodyLimitError(err) || isTargetPushDeadlineError(err)
+}
+
+// actionableTargetPushError augments a one-shot push failure with guidance
+// when the target rejected the pack for being too large or slow but batched
+// bootstrap couldn't take over — which, on the one-shot path, means the source
+// can't serve the protocol-v2 fetch filter that checkpointing requires. The
+// extra context tells the user why the obvious knob (--target-max-pack-bytes)
+// won't help here, instead of leaving a bare "http 408". Returns err unchanged
+// for non-batchable failures or when batching is in fact available.
+func actionableTargetPushError(p Params, err error) error {
+	if !isBatchableTargetPushError(err) {
+		return err
+	}
+	if p.SourceService != nil && p.SourceService.SupportsBootstrapBatch() {
+		return err
+	}
+	return fmt.Errorf("%w (target rejected the pack as too large or too slow to receive; "+
+		"batched bootstrap could split it into smaller pushes, but the source does not "+
+		"support the protocol-v2 fetch filter batched bootstrap requires)", err)
 }
 
 func targetBodyLimit(err error) int64 {

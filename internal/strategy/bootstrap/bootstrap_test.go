@@ -1496,6 +1496,57 @@ func TestExecuteOneShotClosesPackWhenPusherDoesNot(t *testing.T) {
 	}
 }
 
+// noBatchSource is a source that can't serve the protocol-v2 fetch filter
+// batched bootstrap needs, so a one-shot push failure has no batched fallback.
+type noBatchSource struct{ fakeBootstrapSource }
+
+func (noBatchSource) SupportsBootstrapBatch() bool { return false }
+
+func TestAutoTargetMaxPackBytesTimeoutTriggersBatching(t *testing.T) {
+	limit, ok := autoTargetMaxPackBytes(
+		Params{SourceService: fakeBootstrapSource{}},
+		errors.New("target receive-pack: http 408: request timeout"),
+	)
+	if !ok {
+		t.Fatal("autoTargetMaxPackBytes(408) = not ok, want batched fallback")
+	}
+	if limit != defaultTargetMaxPackBytes {
+		t.Fatalf("limit = %d, want default %d", limit, int64(defaultTargetMaxPackBytes))
+	}
+}
+
+func TestExecuteOneShotTimeoutWithoutBatchSupportIsActionable(t *testing.T) {
+	mainRef := plumbing.NewBranchReferenceName("main")
+	mainHash := plumbing.NewHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	pushErr := errors.New("target receive-pack: post RPC stream body: http 408: request timeout")
+
+	_, err := Execute(context.Background(), Params{
+		SourceService: noBatchSource{fakeBootstrapSource{
+			fetchPack: func(_ context.Context, _ gitproto.Conn, _ map[plumbing.ReferenceName]gitproto.DesiredRef, _ map[plumbing.ReferenceName]plumbing.Hash) (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader([]byte("PACK"))), nil
+			},
+		}},
+		TargetPusher: fakeBootstrapPusher{
+			pushPack: func(_ context.Context, _ []gitproto.PushCommand, pack io.ReadCloser) error {
+				_ = pack.Close()
+				return pushErr
+			},
+		},
+		DesiredRefs: map[plumbing.ReferenceName]planner.DesiredRef{
+			mainRef: {SourceRef: mainRef, TargetRef: mainRef, SourceHash: mainHash, Kind: planner.RefKindBranch},
+		},
+	}, "empty target")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want actionable timeout error")
+	}
+	if !errors.Is(err, pushErr) {
+		t.Fatalf("Execute() error does not wrap original push error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "protocol-v2 fetch filter") {
+		t.Fatalf("Execute() error missing batched-bootstrap guidance: %v", err)
+	}
+}
+
 func TestExecuteBatchedClosesCheckpointPackOnPushError(t *testing.T) {
 	mainRef := plumbing.NewBranchReferenceName("main")
 	hashes := makeLinearCommitChain(t, 1)
