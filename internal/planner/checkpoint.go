@@ -51,7 +51,7 @@ func FirstParentChainStoppingAt(store storer.EncodedObjectStorer, tip plumbing.H
 		}
 		commit, err = object.GetCommit(store, parent)
 		if err != nil {
-			return nil, fmt.Errorf("load parent commit %s: %w", commit.ParentHashes[0], err)
+			return nil, fmt.Errorf("load parent commit %s: %w", parent, err)
 		}
 	}
 	// Reverse in-place to get root-to-tip order.
