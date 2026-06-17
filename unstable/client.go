@@ -10,7 +10,7 @@ import (
 	"entire.io/entire/git-sync"
 	"entire.io/entire/git-sync/internal/syncer"
 	"entire.io/entire/git-sync/internal/validation"
-	"entire.io/entire/git-sync/internalbridge"
+	"entire.io/entire/git-sync/internal/internalbridge"
 )
 
 const DefaultMaterializedMaxObjects = syncer.DefaultMaterializedMaxObjects
