@@ -318,8 +318,12 @@ func storeV2FetchPack(store storer.Storer, r io.Reader, verbose bool, progressOu
 
 // consumeV2FetchPack walks a protocol v2 fetch response envelope
 // (acknowledgments / shallow-info / packfile sections) and hands the
-// demuxed packfile stream to consumer when one is present. Returns nil
-// for empty / no-pack responses without invoking consumer.
+// demuxed packfile stream to consumer. A response that ends without ever
+// delivering a packfile is reported as io.ErrUnexpectedEOF rather than as
+// silent success: by the time we reach here wants is non-empty (callers
+// short-circuit the up-to-date case earlier), so the server owes us a
+// packfile section. This mirrors the sibling openV2PackStream — previously a
+// truncated or pack-less response let a fetch "succeed" having stored nothing.
 func consumeV2FetchPack(
 	r io.Reader,
 	verbose bool,
@@ -335,7 +339,7 @@ func consumeV2FetchPack(
 				if expectPackfile {
 					return errors.New("expected packfile to be sent after 'ready'")
 				}
-				return nil
+				return io.ErrUnexpectedEOF
 			}
 			return fmt.Errorf("decode protocol v2 fetch response: %w", err)
 		}
@@ -344,7 +348,7 @@ func consumeV2FetchPack(
 			if expectPackfile {
 				return errors.New("expected packfile to be sent after 'ready'")
 			}
-			return nil
+			return io.ErrUnexpectedEOF
 		case PacketDelim, PacketResponseEnd:
 			continue
 		case PacketData:
