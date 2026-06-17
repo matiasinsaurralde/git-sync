@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"testing"
 
 	"entire.io/entire/git-sync/unstable"
@@ -73,6 +75,29 @@ func TestSummarizeRuns(t *testing.T) {
 	}
 	if len(got.RelayModes) != 2 || got.RelayModes[0] != "bootstrap" || got.RelayModes[1] != "bootstrap-batch" {
 		t.Fatalf("unexpected relay modes: %+v", got.RelayModes)
+	}
+}
+
+// When every run fails there are no measurements, so the "unset" -1 sentinels
+// must be cleared rather than leaking into the (JSON) report.
+func TestSummarizeRunsAllFailedHasNoSentinels(t *testing.T) {
+	runs := []runSummary{{Index: 1, Error: "boom"}, {Index: 2, Error: "kaboom"}}
+
+	got := summarizeRuns(runs)
+	if got.SuccessfulRuns != 0 || got.FailedRuns != 2 {
+		t.Fatalf("unexpected counts: %+v", got)
+	}
+	if got.MinWallMillis != 0 || got.MinSyncElapsedMillis != 0 ||
+		got.MinBatchCount != 0 || got.MinPlannedBatchCount != 0 {
+		t.Fatalf("expected sentinels cleared to 0, got %+v", got)
+	}
+
+	data, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Contains(data, []byte("-1")) {
+		t.Fatalf("the -1 sentinel leaked into JSON: %s", data)
 	}
 }
 

@@ -229,10 +229,15 @@ func run(ctx context.Context, args []string) error {
 			return fmt.Errorf("marshal report: %w", err)
 		}
 		fmt.Println(string(data))
-		return nil
+	} else {
+		printTextReport(report)
 	}
 
-	printTextReport(report)
+	// Report (printed above) is the useful artifact; still exit non-zero so a
+	// failed run can't pass as success in CI.
+	if report.Aggregate.FailedRuns > 0 {
+		return fmt.Errorf("%d of %d benchmark run(s) failed", report.Aggregate.FailedRuns, len(report.Runs))
+	}
 	return nil
 }
 
@@ -357,6 +362,17 @@ func summarizeRuns(runs []runSummary) aggregateSummary {
 	if batchedRuns > 0 {
 		summary.AvgBatchCount = float64(totalBatchCount) / float64(batchedRuns)
 		summary.AvgPlannedBatchCount = float64(totalPlanned) / float64(batchedRuns)
+	}
+	// The Min* fields start at -1 as an "unset" sentinel updated by the first
+	// qualifying run. With no such run, replace the sentinel with 0 so it never
+	// leaks into the report (the batch counts are omitempty, so 0 drops them).
+	if okRuns == 0 {
+		summary.MinWallMillis = 0
+		summary.MinSyncElapsedMillis = 0
+	}
+	if batchedRuns == 0 {
+		summary.MinBatchCount = 0
+		summary.MinPlannedBatchCount = 0
 	}
 	summary.RelayModes = uniqueStrings(relayModes)
 	return summary
