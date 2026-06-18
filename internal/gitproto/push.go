@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -50,18 +51,40 @@ func NewPusher(conn Conn, adv *packp.AdvRefs, verbose bool) *Pusher {
 	return &Pusher{Conn: conn, Adv: adv, Verbose: verbose}
 }
 
-// maxRefUpdatesPerPush bounds how many ref-update commands ride in a single
-// receive-pack request. entire-server rejects a push carrying more than 25_000
-// commands (server/githttp.maxRefUpdateCommands), and other servers may impose
-// their own caps; staying well under that lets a sync of a many-ref repo split
-// across several pushes instead of failing outright.
+// defaultMaxRefUpdatesPerPush bounds how many ref-update commands ride in a
+// single receive-pack request. The default is deliberately conservative:
+// GitHub returns 500 Internal Server Error when a single push updates ~10k refs
+// at once but accepts 5k, so 5_000 mirrors a many-ref repo there without
+// tripping its (undocumented) ceiling. entire-server tolerates far more — its
+// hard cap is 25_000 (server/githttp.maxRefUpdateCommands) — so trusted callers
+// pushing to entire-server raise this via MaxRefUpdatesEnv to cut round trips.
 //
 // Splitting is safe because the pack accompanying the first batch carries every
 // object for the whole push: receive-pack commits the entire received pack into
 // the object store (entire-server via CommitQuarantinedFanout, canonical git via
 // tmp_objdir_migrate — neither prunes objects unreachable from the pushed tips),
 // so the remaining batches only need to move ref pointers and carry no pack.
-const maxRefUpdatesPerPush = 20_000
+const defaultMaxRefUpdatesPerPush = 5_000
+
+// MaxRefUpdatesEnv overrides defaultMaxRefUpdatesPerPush with a positive
+// integer. Raise it for targets known to accept large ref-update pushes (e.g.
+// entire-server, up to its 25_000 cap) to reduce round trips; lower it for a
+// provider that rejects even the default. Invalid or non-positive values fall
+// back to the default.
+const MaxRefUpdatesEnv = "GITSYNC_MAX_REF_UPDATES_PER_PUSH"
+
+// maxRefUpdatesPerPush is resolved once from the environment so the limit can be
+// tuned per target without rebuilding (see MaxRefUpdatesEnv).
+var maxRefUpdatesPerPush = resolveMaxRefUpdatesPerPush()
+
+func resolveMaxRefUpdatesPerPush() int {
+	if v := os.Getenv(MaxRefUpdatesEnv); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxRefUpdatesPerPush
+}
 
 // chunkRefUpdates splits commands into batches no larger than
 // maxRefUpdatesPerPush. Input that already fits is returned as a single batch

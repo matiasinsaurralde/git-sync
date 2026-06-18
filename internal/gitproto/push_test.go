@@ -790,6 +790,20 @@ func makeCreateCommands(n int) []PushCommand {
 	return cmds
 }
 
+func TestResolveMaxRefUpdatesPerPush(t *testing.T) {
+	t.Setenv(MaxRefUpdatesEnv, "")
+	require.Equal(t, defaultMaxRefUpdatesPerPush, resolveMaxRefUpdatesPerPush())
+
+	t.Setenv(MaxRefUpdatesEnv, "20000")
+	require.Equal(t, 20000, resolveMaxRefUpdatesPerPush())
+
+	// Invalid or non-positive values fall back to the default.
+	for _, bad := range []string{"0", "-5", "lots"} {
+		t.Setenv(MaxRefUpdatesEnv, bad)
+		require.Equal(t, defaultMaxRefUpdatesPerPush, resolveMaxRefUpdatesPerPush(), "value %q", bad)
+	}
+}
+
 func TestChunkRefUpdates(t *testing.T) {
 	require.Len(t, chunkRefUpdates(nil), 1)
 	require.Len(t, chunkRefUpdates(make([]PushCommand, maxRefUpdatesPerPush)), 1)
