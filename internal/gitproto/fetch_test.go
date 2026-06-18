@@ -857,6 +857,29 @@ func TestStoreV2FetchPackRejectsAcknowledgmentsWithoutReady(t *testing.T) {
 	}
 }
 
+// A response that ends with a bare flush — no acknowledgments, no packfile —
+// must be a hard error, not silent success that stores nothing. Matches
+// openV2PackStream's io.ErrUnexpectedEOF.
+func TestStoreV2FetchPackRejectsResponseWithoutPackfile(t *testing.T) {
+	var wire bytes.Buffer
+	if err := pktline.WriteFlush(&wire); err != nil {
+		t.Fatalf("write flush: %v", err)
+	}
+	err := storeV2FetchPack(memory.NewStorage(), &wire, false, nil)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("error = %v, want io.ErrUnexpectedEOF", err)
+	}
+}
+
+// A truncated response (EOF before any packfile) is likewise a hard error,
+// not success.
+func TestStoreV2FetchPackRejectsTruncatedResponse(t *testing.T) {
+	err := storeV2FetchPack(memory.NewStorage(), bytes.NewReader(nil), false, nil)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("error = %v, want io.ErrUnexpectedEOF", err)
+	}
+}
+
 func TestOpenV2PackStreamRejectsAcknowledgmentsWithoutReady(t *testing.T) {
 	var wire bytes.Buffer
 	if _, err := pktline.WriteString(&wire, "acknowledgments\n"); err != nil {
