@@ -50,6 +50,44 @@ func NewPusher(conn Conn, adv *packp.AdvRefs, verbose bool) *Pusher {
 	return &Pusher{Conn: conn, Adv: adv, Verbose: verbose}
 }
 
+// maxRefUpdatesPerPush bounds how many ref-update commands ride in a single
+// receive-pack request. entire-server rejects a push carrying more than 25_000
+// commands (server/githttp.maxRefUpdateCommands), and other servers may impose
+// their own caps; staying well under that lets a sync of a many-ref repo split
+// across several pushes instead of failing outright.
+//
+// Splitting is safe because the pack accompanying the first batch carries every
+// object for the whole push: receive-pack commits the entire received pack into
+// the object store (entire-server via CommitQuarantinedFanout, canonical git via
+// tmp_objdir_migrate — neither prunes objects unreachable from the pushed tips),
+// so the remaining batches only need to move ref pointers and carry no pack.
+const maxRefUpdatesPerPush = 20_000
+
+// chunkRefUpdates splits commands into batches no larger than
+// maxRefUpdatesPerPush. Input that already fits is returned as a single batch
+// (including the empty slice, so callers preserve their one-request behavior).
+func chunkRefUpdates(commands []PushCommand) [][]PushCommand {
+	if len(commands) <= maxRefUpdatesPerPush {
+		return [][]PushCommand{commands}
+	}
+	batches := make([][]PushCommand, 0, (len(commands)+maxRefUpdatesPerPush-1)/maxRefUpdatesPerPush)
+	for start := 0; start < len(commands); start += maxRefUpdatesPerPush {
+		end := min(start+maxRefUpdatesPerPush, len(commands))
+		batches = append(batches, commands[start:end])
+	}
+	return batches
+}
+
+// splitFirstBatch peels off the first batch (up to maxRefUpdatesPerPush) so a
+// push can carry the pack with that batch and send the remainder as ref-only
+// follow-ups. rest is nil when commands already fit in a single request.
+func splitFirstBatch(commands []PushCommand) (first, rest []PushCommand) {
+	if len(commands) <= maxRefUpdatesPerPush {
+		return commands, nil
+	}
+	return commands[:maxRefUpdatesPerPush], commands[maxRefUpdatesPerPush:]
+}
+
 // PushPack streams a pack to the target.
 func (p *Pusher) PushPack(ctx context.Context, commands []PushCommand, pack io.ReadCloser) error {
 	return PushPack(ctx, p.Conn, p.Adv, commands, pack, p.Verbose, p.OnRejection)
@@ -358,6 +396,55 @@ func sendReceivePack(
 
 // PushObjects pushes locally-materialized objects to the target.
 //
+// A push within the per-request ref-update cap (maxRefUpdatesPerPush) is a
+// single atomic receive-pack request. A larger push is split: the materialized
+// pack — which carries every object for the whole push — rides with the first
+// batch of object-bearing commands, then the remaining refs (and any deletes)
+// move as ref-only updates because the objects are already committed.
+func PushObjects(
+	ctx context.Context,
+	conn Conn,
+	adv *packp.AdvRefs,
+	commands []PushCommand,
+	store storer.Storer,
+	hashes []plumbing.Hash,
+	verbose bool,
+	onRejection func(plumbing.ReferenceName, string),
+) error {
+	if len(commands) <= maxRefUpdatesPerPush {
+		return pushObjectsBatch(ctx, conn, adv, commands, store, hashes, verbose, onRejection)
+	}
+
+	updates := make([]PushCommand, 0, len(commands))
+	var deletes []PushCommand
+	for _, c := range commands {
+		if c.Delete {
+			deletes = append(deletes, c)
+		} else {
+			updates = append(updates, c)
+		}
+	}
+
+	if len(updates) > 0 {
+		first, rest := splitFirstBatch(updates)
+		if err := pushObjectsBatch(ctx, conn, adv, first, store, hashes, verbose, onRejection); err != nil {
+			return err
+		}
+		if len(rest) > 0 {
+			if err := PushCommands(ctx, conn, adv, rest, verbose, onRejection); err != nil {
+				return err
+			}
+		}
+	}
+	if len(deletes) > 0 {
+		return PushCommands(ctx, conn, adv, deletes, verbose, onRejection)
+	}
+	return nil
+}
+
+// pushObjectsBatch encodes the selected objects into a pack and sends one
+// receive-pack request for commands.
+//
 // Delta selection runs synchronously up front via
 // packfile.DeltaSelector. The selected objects are then handed back to
 // a packfile.Encoder behind a passthrough ObjectSelector, so the
@@ -366,7 +453,7 @@ func sendReceivePack(
 // the mid-stream stall that occurs when Encode runs selection itself —
 // CDN edges treat the resulting idle gap as a stalled upload and close
 // the connection. See go-git PR #2142 for the API hook.
-func PushObjects(
+func pushObjectsBatch(
 	ctx context.Context,
 	conn Conn,
 	adv *packp.AdvRefs,
@@ -570,7 +657,13 @@ func PushPack(
 		}
 	}
 
-	req, _, _, err := buildUpdateRequest(adv, commands, verbose)
+	// The pack carries every object for all commands, so it rides with the
+	// first batch; once committed the remaining refs update without re-sending
+	// objects. This keeps each request under the server's per-push ref-update
+	// cap (see maxRefUpdatesPerPush).
+	first, rest := splitFirstBatch(commands)
+
+	req, _, _, err := buildUpdateRequest(adv, first, verbose)
 	if err != nil {
 		_ = pack.Close()
 		return err
@@ -583,6 +676,10 @@ func PushPack(
 	}
 	if closeErr != nil {
 		return fmt.Errorf("close pack: %w", closeErr)
+	}
+
+	if len(rest) > 0 {
+		return PushCommands(ctx, conn, adv, rest, verbose, onRejection)
 	}
 	return nil
 }
@@ -598,6 +695,24 @@ func PushPack(
 // that tolerate the pack-less form. Delete-only pushes carry no pack, as git
 // requires.
 func PushCommands(
+	ctx context.Context,
+	conn Conn,
+	adv *packp.AdvRefs,
+	commands []PushCommand,
+	verbose bool,
+	onRejection func(plumbing.ReferenceName, string),
+) error {
+	for _, batch := range chunkRefUpdates(commands) {
+		if err := pushCommandsBatch(ctx, conn, adv, batch, verbose, onRejection); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// pushCommandsBatch sends one receive-pack request for a single batch of
+// ref-only commands; the referenced objects must already exist on the target.
+func pushCommandsBatch(
 	ctx context.Context,
 	conn Conn,
 	adv *packp.AdvRefs,

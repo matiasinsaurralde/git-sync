@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -734,4 +735,120 @@ func TestAsRefRejectedError_ToleratesPointerCommandStatusErr(t *testing.T) {
 	if !errors.As(wrapped, &rej) || rej.Reason != "remote ref has changed" {
 		t.Fatalf("must classify the pointer form as *RefRejectedError; got %#v", wrapped)
 	}
+}
+
+// recordedPush captures one receive-pack request as the server saw it: how
+// many ref-update commands it carried and the pack bytes that followed them.
+type recordedPush struct {
+	commands int
+	pack     []byte
+}
+
+// pushRecorder is a receive-pack server that records every request, so a test
+// can assert how a single PushPack/PushCommands call split into batches.
+type pushRecorder struct {
+	mu     sync.Mutex
+	pushes []recordedPush
+}
+
+func (rec *pushRecorder) server(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+		}
+		_ = r.Body.Close()
+
+		rd := bytes.NewReader(body)
+		req := &packp.UpdateRequests{}
+		if err := req.Decode(rd); err != nil {
+			t.Errorf("decode update requests: %v", err)
+		}
+		rest, err := io.ReadAll(rd)
+		if err != nil {
+			t.Errorf("read pack remainder: %v", err)
+		}
+
+		rec.mu.Lock()
+		rec.pushes = append(rec.pushes, recordedPush{commands: len(req.Commands), pack: rest})
+		rec.mu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+	}))
+}
+
+func makeCreateCommands(n int) []PushCommand {
+	h := plumbing.NewHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	cmds := make([]PushCommand, n)
+	for i := range cmds {
+		cmds[i] = PushCommand{
+			Name: plumbing.ReferenceName(fmt.Sprintf("refs/heads/b-%d", i)),
+			New:  h,
+		}
+	}
+	return cmds
+}
+
+func TestChunkRefUpdates(t *testing.T) {
+	require.Len(t, chunkRefUpdates(nil), 1)
+	require.Len(t, chunkRefUpdates(make([]PushCommand, maxRefUpdatesPerPush)), 1)
+
+	batches := chunkRefUpdates(make([]PushCommand, maxRefUpdatesPerPush+1))
+	require.Len(t, batches, 2)
+	require.Len(t, batches[0], maxRefUpdatesPerPush)
+	require.Len(t, batches[1], 1)
+}
+
+// TestPushCommandsBatchesOverCap guards that a ref-only push exceeding the
+// per-request cap splits into multiple receive-pack requests, each within the
+// cap, so the server's too-many-ref-update-commands limit isn't tripped.
+func TestPushCommandsBatchesOverCap(t *testing.T) {
+	rec := &pushRecorder{}
+	srv := rec.server(t)
+	defer srv.Close()
+
+	conn := connForServer(t, srv)
+	adv := &packp.AdvRefs{}
+
+	n := maxRefUpdatesPerPush + 5
+	require.NoError(t, PushCommands(context.Background(), conn, adv, makeCreateCommands(n), false, nil))
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	require.Len(t, rec.pushes, 2)
+	require.Equal(t, maxRefUpdatesPerPush, rec.pushes[0].commands)
+	require.Equal(t, 5, rec.pushes[1].commands)
+	// Every create batch carries a valid empty pack.
+	require.True(t, bytes.HasSuffix(rec.pushes[0].pack, emptyPack(adv)))
+	require.True(t, bytes.HasSuffix(rec.pushes[1].pack, emptyPack(adv)))
+}
+
+// TestPushPackBatchesOverCap guards that a pack push exceeding the per-request
+// cap sends the pack with the first batch and the remaining refs as ref-only
+// follow-up batches (the objects are already committed by the first request).
+func TestPushPackBatchesOverCap(t *testing.T) {
+	rec := &pushRecorder{}
+	srv := rec.server(t)
+	defer srv.Close()
+
+	conn := connForServer(t, srv)
+	adv := &packp.AdvRefs{}
+
+	marker := []byte("REAL-PACK-PAYLOAD-MARKER")
+	pack := io.NopCloser(bytes.NewReader(marker))
+
+	n := maxRefUpdatesPerPush + 5
+	require.NoError(t, PushPack(context.Background(), conn, adv, makeCreateCommands(n), pack, false, nil))
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	require.Len(t, rec.pushes, 2)
+	// First batch: the real pack rides with a full cap's worth of commands.
+	require.Equal(t, maxRefUpdatesPerPush, rec.pushes[0].commands)
+	require.Equal(t, marker, rec.pushes[0].pack)
+	// Remaining refs follow ref-only: an empty pack, no object payload.
+	require.Equal(t, 5, rec.pushes[1].commands)
+	require.True(t, bytes.HasSuffix(rec.pushes[1].pack, emptyPack(adv)))
+	require.False(t, bytes.Contains(rec.pushes[1].pack, marker))
 }
