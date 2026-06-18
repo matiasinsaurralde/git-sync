@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Removed
+
+- The built-in Entire DB credential store integration (`hosts.json` active-user lookup, the file/keyring token store, and OAuth refresh-token handling). `auth.Resolve` now resolves only explicit token/bearer credentials; everything else defers to the git credential helper on a 401, exactly as for any other remote. The Entire mirroring pipeline and the `git-remote-entire` helper already supply credentials directly (installation / repo-scoped tokens at the transport layer), so nothing produced the `hosts.json`/token-store layout this code read. This drops the `github.com/zalando/go-keyring` dependency and, with the file token store gone, the package now compiles on Windows without a `flock` shim.
+
 ### Fixed
 
 - Concurrent **create** races on the target are now classified as `ErrTargetRefMoved`, matching the existing concurrent-update handling. entire-server rejects a create command (old = zero hash) for a ref that already exists with `already exists`; git-sync only plans a create for a ref it found absent at plan time, so that rejection is an unambiguous benign race — a second sync of the same repo created the ref first — exactly like the update-side `remote ref has changed`. Previously only the update reason was in `concurrentMoveMarkers`, so a create race fell through as a generic push failure and `errors.Is(err, ErrTargetRefMoved)` returned false; embedders that key redelivery/alerting off the sentinel (e.g. mirror-pipeline's worker) misclassified it as a hard sync failure. Both the create and update CAS rejections now satisfy `errors.Is(err, ErrTargetRefMoved)`.

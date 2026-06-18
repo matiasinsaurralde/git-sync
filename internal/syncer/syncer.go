@@ -369,10 +369,7 @@ func newConn(raw Endpoint, label string, stats *statsCollector, httpClient *http
 		BearerToken:   raw.BearerToken,
 		SkipTLSVerify: raw.SkipTLSVerify,
 	}
-	authMethod, err := auth.Resolve(authEp, ep)
-	if err != nil {
-		return nil, fmt.Errorf("resolve auth: %w", err)
-	}
+	authMethod := auth.Resolve(authEp, ep)
 	stats.setSideDisplay(label, hostnameFromURL(raw.URL))
 	client := instrumentHTTPClient(httpClient, raw.SkipTLSVerify, label, stats)
 	conn := gitproto.NewHTTPConnWithClient(ep, label, authMethod, client)
