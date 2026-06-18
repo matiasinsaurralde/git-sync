@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -152,7 +153,7 @@ func TestPushPackClosesPackOnSuccess(t *testing.T) {
 	err := PushPack(context.Background(), conn, adv, []PushCommand{{
 		Name: "refs/heads/main",
 		New:  plumbing.NewHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-	}}, pack, false, nil)
+	}}, pack, 0, false, nil)
 	if err != nil {
 		t.Fatalf("PushPack returned error: %v", err)
 	}
@@ -179,7 +180,7 @@ func TestPushPackClosesPackOnReceivePackError(t *testing.T) {
 	err := PushPack(context.Background(), conn, adv, []PushCommand{{
 		Name: "refs/heads/main",
 		New:  plumbing.NewHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-	}}, pack, false, nil)
+	}}, pack, 0, false, nil)
 	if err == nil {
 		t.Fatal("expected PushPack to return an error")
 	}
@@ -209,7 +210,7 @@ func TestPushPackClosesPackOnContextCanceled(t *testing.T) {
 		done <- PushPack(ctx, conn, adv, []PushCommand{{
 			Name: "refs/heads/main",
 			New:  plumbing.NewHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-		}}, pack, false, nil)
+		}}, pack, 0, false, nil)
 	}()
 
 	select {
@@ -265,7 +266,7 @@ func TestPushPackStartsHTTPBeforePackFullyRead(t *testing.T) {
 		done <- PushPack(context.Background(), conn, adv, []PushCommand{{
 			Name: "refs/heads/main",
 			New:  plumbing.NewHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-		}}, pack, false, nil)
+		}}, pack, 0, false, nil)
 	}()
 
 	select {
@@ -322,7 +323,7 @@ func TestPushObjectsStreamsBody(t *testing.T) {
 	err := PushObjects(context.Background(), conn, adv, []PushCommand{{
 		Name: "refs/heads/main",
 		New:  plumbing.NewHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-	}}, memory.NewStorage(), nil, false, nil)
+	}}, memory.NewStorage(), nil, 0, false, nil)
 	if err != nil {
 		t.Fatalf("PushObjects: %v", err)
 	}
@@ -418,7 +419,7 @@ func TestPushCommandsSendsEmptyPackForCreate(t *testing.T) {
 	err := PushCommands(context.Background(), conn, adv, []PushCommand{{
 		Name: "refs/heads/docs-rules",
 		New:  plumbing.NewHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-	}}, false, nil)
+	}}, 0, false, nil)
 	require.NoError(t, err)
 
 	require.True(t, bytes.HasSuffix(awaitBody(t, bodies), emptyPack(adv)),
@@ -437,7 +438,7 @@ func TestPushCommandsSendsNoPackForDeleteOnly(t *testing.T) {
 		Name:   "refs/gitsync/bootstrap/heads/docs-rules",
 		Old:    plumbing.NewHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
 		Delete: true,
-	}}, false, nil)
+	}}, 0, false, nil)
 	require.NoError(t, err)
 
 	require.False(t, bytes.Contains(awaitBody(t, bodies), []byte("PACK")),
@@ -494,7 +495,7 @@ func TestPushPackRejectsDeletes(t *testing.T) {
 
 	err = PushPack(context.Background(), conn, adv, []PushCommand{
 		{Name: "refs/heads/old", Delete: true},
-	}, pack, false, nil)
+	}, pack, 0, false, nil)
 	if err == nil {
 		t.Fatal("expected error for delete in pack push")
 	}
@@ -734,4 +735,190 @@ func TestAsRefRejectedError_ToleratesPointerCommandStatusErr(t *testing.T) {
 	if !errors.As(wrapped, &rej) || rej.Reason != "remote ref has changed" {
 		t.Fatalf("must classify the pointer form as *RefRejectedError; got %#v", wrapped)
 	}
+}
+
+// recordedPush captures one receive-pack request as the server saw it: how
+// many ref-update commands it carried and the pack bytes that followed them.
+type recordedPush struct {
+	commands int
+	pack     []byte
+}
+
+// pushRecorder is a receive-pack server that records every request, so a test
+// can assert how a single PushPack/PushCommands call split into batches.
+type pushRecorder struct {
+	mu     sync.Mutex
+	pushes []recordedPush
+}
+
+func (rec *pushRecorder) server(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+		}
+		_ = r.Body.Close()
+
+		rd := bytes.NewReader(body)
+		req := &packp.UpdateRequests{}
+		if err := req.Decode(rd); err != nil {
+			t.Errorf("decode update requests: %v", err)
+		}
+		rest, err := io.ReadAll(rd)
+		if err != nil {
+			t.Errorf("read pack remainder: %v", err)
+		}
+
+		rec.mu.Lock()
+		rec.pushes = append(rec.pushes, recordedPush{commands: len(req.Commands), pack: rest})
+		rec.mu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+	}))
+}
+
+func makeCreateCommands(n int) []PushCommand {
+	h := plumbing.NewHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	cmds := make([]PushCommand, n)
+	for i := range cmds {
+		cmds[i] = PushCommand{
+			Name: plumbing.ReferenceName(fmt.Sprintf("refs/heads/b-%d", i)),
+			New:  h,
+		}
+	}
+	return cmds
+}
+
+func TestResolveMaxRefUpdatesPerPush(t *testing.T) {
+	t.Setenv(MaxRefUpdatesEnv, "")
+	require.Equal(t, defaultMaxRefUpdatesPerPush, resolveMaxRefUpdatesPerPush())
+
+	t.Setenv(MaxRefUpdatesEnv, "20000")
+	require.Equal(t, 20000, resolveMaxRefUpdatesPerPush())
+
+	// Invalid or non-positive values fall back to the default.
+	for _, bad := range []string{"0", "-5", "lots"} {
+		t.Setenv(MaxRefUpdatesEnv, bad)
+		require.Equal(t, defaultMaxRefUpdatesPerPush, resolveMaxRefUpdatesPerPush(), "value %q", bad)
+	}
+}
+
+func TestChunkRefUpdates(t *testing.T) {
+	require.Len(t, chunkRefUpdates(nil, 10), 1)
+	require.Len(t, chunkRefUpdates(make([]PushCommand, 10), 10), 1)
+
+	batches := chunkRefUpdates(make([]PushCommand, 11), 10)
+	require.Len(t, batches, 2)
+	require.Len(t, batches[0], 10)
+	require.Len(t, batches[1], 1)
+}
+
+func TestEffectiveMaxRefUpdates(t *testing.T) {
+	require.Equal(t, 7, effectiveMaxRefUpdates(7))
+	// Zero/negative falls back to the package default (env-or-default).
+	require.Equal(t, maxRefUpdatesPerPush, effectiveMaxRefUpdates(0))
+	require.Equal(t, maxRefUpdatesPerPush, effectiveMaxRefUpdates(-1))
+}
+
+// TestPushCommandsBatchesOverCap guards that a ref-only push exceeding the
+// per-request limit splits into multiple receive-pack requests, each within the
+// limit, so the server's too-many-ref-update-commands cap isn't tripped.
+func TestPushCommandsBatchesOverCap(t *testing.T) {
+	rec := &pushRecorder{}
+	srv := rec.server(t)
+	defer srv.Close()
+
+	conn := connForServer(t, srv)
+	adv := &packp.AdvRefs{}
+
+	// limit=3, 7 refs → batches of 3, 3, 1.
+	require.NoError(t, PushCommands(context.Background(), conn, adv, makeCreateCommands(7), 3, false, nil))
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	require.Len(t, rec.pushes, 3)
+	require.Equal(t, []int{3, 3, 1}, []int{rec.pushes[0].commands, rec.pushes[1].commands, rec.pushes[2].commands})
+	// Every create batch carries a valid empty pack.
+	for _, p := range rec.pushes {
+		require.True(t, bytes.HasSuffix(p.pack, emptyPack(adv)))
+	}
+}
+
+// TestPushPackBatchesOverCap guards that a pack push exceeding the per-request
+// limit sends the pack with the first batch and the remaining refs as ref-only
+// follow-up batches (the objects are already committed by the first request).
+func TestPushPackBatchesOverCap(t *testing.T) {
+	rec := &pushRecorder{}
+	srv := rec.server(t)
+	defer srv.Close()
+
+	conn := connForServer(t, srv)
+	adv := &packp.AdvRefs{}
+
+	marker := []byte("REAL-PACK-PAYLOAD-MARKER")
+	pack := io.NopCloser(bytes.NewReader(marker))
+
+	// limit=3, 7 refs → first batch of 3 carries the pack, then 3 + 1 ref-only.
+	require.NoError(t, PushPack(context.Background(), conn, adv, makeCreateCommands(7), pack, 3, false, nil))
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	require.Len(t, rec.pushes, 3)
+	// First batch: the real pack rides with the first limit's worth of commands.
+	require.Equal(t, 3, rec.pushes[0].commands)
+	require.Equal(t, marker, rec.pushes[0].pack)
+	// Remaining refs follow ref-only: an empty pack, no object payload.
+	require.Equal(t, 3, rec.pushes[1].commands)
+	require.Equal(t, 1, rec.pushes[2].commands)
+	for _, p := range rec.pushes[1:] {
+		require.True(t, bytes.HasSuffix(p.pack, emptyPack(adv)))
+		require.False(t, bytes.Contains(p.pack, marker))
+	}
+}
+
+// TestPushCommandsVerboseLogsBatches confirms a multi-batch push reports each
+// batch to the progress writer when verbose, and stays quiet for one batch.
+func TestPushCommandsVerboseLogsBatches(t *testing.T) {
+	rec := &pushRecorder{}
+	srv := rec.server(t)
+	defer srv.Close()
+
+	adv := &packp.AdvRefs{}
+
+	var buf bytes.Buffer
+	conn := connForServer(t, srv)
+	conn.ProgressOut = &buf
+	require.NoError(t, PushCommands(context.Background(), conn, adv, makeCreateCommands(7), 3, true, nil))
+
+	out := buf.String()
+	require.Contains(t, out, "pushed ref-update batch 1/3 (3 refs)")
+	require.Contains(t, out, "pushed ref-update batch 2/3 (3 refs)")
+	require.Contains(t, out, "pushed ref-update batch 3/3 (1 refs)")
+
+	// Single batch: no per-batch noise.
+	var single bytes.Buffer
+	conn2 := connForServer(t, srv)
+	conn2.ProgressOut = &single
+	require.NoError(t, PushCommands(context.Background(), conn2, adv, makeCreateCommands(2), 3, true, nil))
+	require.NotContains(t, single.String(), "pushed ref-update batch")
+}
+
+// TestPushPackUsesDefaultLimitWhenZero confirms maxRefUpdates=0 falls back to
+// the package default (a small push stays a single request).
+func TestPushPackUsesDefaultLimitWhenZero(t *testing.T) {
+	rec := &pushRecorder{}
+	srv := rec.server(t)
+	defer srv.Close()
+
+	conn := connForServer(t, srv)
+	adv := &packp.AdvRefs{}
+	pack := io.NopCloser(bytes.NewReader([]byte("PACK-PAYLOAD")))
+
+	require.NoError(t, PushPack(context.Background(), conn, adv, makeCreateCommands(3), pack, 0, false, nil))
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	require.Len(t, rec.pushes, 1)
+	require.Equal(t, 3, rec.pushes[0].commands)
 }
