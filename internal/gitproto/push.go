@@ -44,6 +44,11 @@ type Pusher struct {
 	Adv         *packp.AdvRefs
 	Verbose     bool
 	OnRejection func(refName plumbing.ReferenceName, status string)
+
+	// MaxRefUpdates caps ref-update commands per receive-pack request. Zero
+	// uses the env-or-default limit (see MaxRefUpdatesEnv); a positive value
+	// overrides it — e.g. from the --target-max-ref-updates flag.
+	MaxRefUpdates int
 }
 
 // NewPusher builds a target-side push executor.
@@ -86,45 +91,70 @@ func resolveMaxRefUpdatesPerPush() int {
 	return defaultMaxRefUpdatesPerPush
 }
 
-// chunkRefUpdates splits commands into batches no larger than
-// maxRefUpdatesPerPush. Input that already fits is returned as a single batch
-// (including the empty slice, so callers preserve their one-request behavior).
-func chunkRefUpdates(commands []PushCommand) [][]PushCommand {
-	if len(commands) <= maxRefUpdatesPerPush {
+// effectiveMaxRefUpdates resolves a per-push limit: a positive override wins,
+// otherwise the env-or-default limit applies.
+func effectiveMaxRefUpdates(maxRefUpdates int) int {
+	if maxRefUpdates > 0 {
+		return maxRefUpdates
+	}
+	return maxRefUpdatesPerPush
+}
+
+// chunkRefUpdates splits commands into batches no larger than limit. Input that
+// already fits is returned as a single batch (including the empty slice, so
+// callers preserve their one-request behavior).
+func chunkRefUpdates(commands []PushCommand, limit int) [][]PushCommand {
+	if len(commands) <= limit {
 		return [][]PushCommand{commands}
 	}
-	batches := make([][]PushCommand, 0, (len(commands)+maxRefUpdatesPerPush-1)/maxRefUpdatesPerPush)
-	for start := 0; start < len(commands); start += maxRefUpdatesPerPush {
-		end := min(start+maxRefUpdatesPerPush, len(commands))
+	batches := make([][]PushCommand, 0, (len(commands)+limit-1)/limit)
+	for start := 0; start < len(commands); start += limit {
+		end := min(start+limit, len(commands))
 		batches = append(batches, commands[start:end])
 	}
 	return batches
 }
 
-// splitFirstBatch peels off the first batch (up to maxRefUpdatesPerPush) so a
-// push can carry the pack with that batch and send the remainder as ref-only
-// follow-ups. rest is nil when commands already fit in a single request.
-func splitFirstBatch(commands []PushCommand) (first, rest []PushCommand) {
-	if len(commands) <= maxRefUpdatesPerPush {
+// splitFirstBatch peels off the first batch (up to limit) so a push can carry
+// the pack with that batch and send the remainder as ref-only follow-ups. rest
+// is nil when commands already fit in a single request.
+func splitFirstBatch(commands []PushCommand, limit int) (first, rest []PushCommand) {
+	if len(commands) <= limit {
 		return commands, nil
 	}
-	return commands[:maxRefUpdatesPerPush], commands[maxRefUpdatesPerPush:]
+	return commands[:limit], commands[limit:]
+}
+
+// logRefUpdateBatch reports completion of one ref-update batch to the progress
+// writer. Ref-only follow-up batches push with progress suppressed (their
+// sideband carries nothing but a bare "target:" line per batch), so this is the
+// only per-batch signal; it stays quiet unless verbose and the push actually
+// spanned multiple batches.
+func logRefUpdateBatch(conn Conn, verbose bool, batchNum, totalBatches, refs int) {
+	if !verbose || totalBatches <= 1 {
+		return
+	}
+	w := conn.ProgressWriter()
+	if w == nil {
+		w = os.Stderr
+	}
+	fmt.Fprintf(w, "target: pushed ref-update batch %d/%d (%d refs)\n", batchNum, totalBatches, refs)
 }
 
 // PushPack streams a pack to the target.
 func (p *Pusher) PushPack(ctx context.Context, commands []PushCommand, pack io.ReadCloser) error {
-	return PushPack(ctx, p.Conn, p.Adv, commands, pack, p.Verbose, p.OnRejection)
+	return PushPack(ctx, p.Conn, p.Adv, commands, pack, p.MaxRefUpdates, p.Verbose, p.OnRejection)
 }
 
 // PushCommands sends ref-only updates. Creates/updates carry an empty pack;
 // delete-only pushes carry no pack. See the package-level PushCommands.
 func (p *Pusher) PushCommands(ctx context.Context, commands []PushCommand) error {
-	return PushCommands(ctx, p.Conn, p.Adv, commands, p.Verbose, p.OnRejection)
+	return PushCommands(ctx, p.Conn, p.Adv, commands, p.MaxRefUpdates, p.Verbose, p.OnRejection)
 }
 
 // PushObjects encodes and pushes locally materialized objects.
 func (p *Pusher) PushObjects(ctx context.Context, commands []PushCommand, store storer.Storer, hashes []plumbing.Hash) error {
-	return PushObjects(ctx, p.Conn, p.Adv, commands, store, hashes, p.Verbose, p.OnRejection)
+	return PushObjects(ctx, p.Conn, p.Adv, commands, store, hashes, p.MaxRefUpdates, p.Verbose, p.OnRejection)
 }
 
 // buildUpdateRequest builds the receive-pack update request.
@@ -419,11 +449,12 @@ func sendReceivePack(
 
 // PushObjects pushes locally-materialized objects to the target.
 //
-// A push within the per-request ref-update cap (maxRefUpdatesPerPush) is a
-// single atomic receive-pack request. A larger push is split: the materialized
-// pack — which carries every object for the whole push — rides with the first
-// batch of object-bearing commands, then the remaining refs (and any deletes)
-// move as ref-only updates because the objects are already committed.
+// A push within the per-request ref-update limit (see effectiveMaxRefUpdates)
+// is a single atomic receive-pack request. A larger push is split: the
+// materialized pack — which carries every object for the whole push — rides
+// with the first batch of object-bearing commands, then the remaining refs (and
+// any deletes) move as ref-only updates because the objects are already
+// committed.
 func PushObjects(
 	ctx context.Context,
 	conn Conn,
@@ -431,10 +462,12 @@ func PushObjects(
 	commands []PushCommand,
 	store storer.Storer,
 	hashes []plumbing.Hash,
+	maxRefUpdates int,
 	verbose bool,
 	onRejection func(plumbing.ReferenceName, string),
 ) error {
-	if len(commands) <= maxRefUpdatesPerPush {
+	limit := effectiveMaxRefUpdates(maxRefUpdates)
+	if len(commands) <= limit {
 		return pushObjectsBatch(ctx, conn, adv, commands, store, hashes, verbose, onRejection)
 	}
 
@@ -449,18 +482,18 @@ func PushObjects(
 	}
 
 	if len(updates) > 0 {
-		first, rest := splitFirstBatch(updates)
+		first, rest := splitFirstBatch(updates, limit)
 		if err := pushObjectsBatch(ctx, conn, adv, first, store, hashes, verbose, onRejection); err != nil {
 			return err
 		}
 		if len(rest) > 0 {
-			if err := PushCommands(ctx, conn, adv, rest, verbose, onRejection); err != nil {
+			if err := PushCommands(ctx, conn, adv, rest, maxRefUpdates, verbose, onRejection); err != nil {
 				return err
 			}
 		}
 	}
 	if len(deletes) > 0 {
-		return PushCommands(ctx, conn, adv, deletes, verbose, onRejection)
+		return PushCommands(ctx, conn, adv, deletes, maxRefUpdates, verbose, onRejection)
 	}
 	return nil
 }
@@ -670,6 +703,7 @@ func PushPack(
 	adv *packp.AdvRefs,
 	commands []PushCommand,
 	pack io.ReadCloser,
+	maxRefUpdates int,
 	verbose bool,
 	onRejection func(plumbing.ReferenceName, string),
 ) error {
@@ -682,9 +716,9 @@ func PushPack(
 
 	// The pack carries every object for all commands, so it rides with the
 	// first batch; once committed the remaining refs update without re-sending
-	// objects. This keeps each request under the server's per-push ref-update
-	// cap (see maxRefUpdatesPerPush).
-	first, rest := splitFirstBatch(commands)
+	// objects. This keeps each request under the target's per-push ref-update
+	// limit (see effectiveMaxRefUpdates).
+	first, rest := splitFirstBatch(commands, effectiveMaxRefUpdates(maxRefUpdates))
 
 	req, _, _, err := buildUpdateRequest(adv, first, verbose)
 	if err != nil {
@@ -702,7 +736,7 @@ func PushPack(
 	}
 
 	if len(rest) > 0 {
-		return PushCommands(ctx, conn, adv, rest, verbose, onRejection)
+		return PushCommands(ctx, conn, adv, rest, maxRefUpdates, verbose, onRejection)
 	}
 	return nil
 }
@@ -722,13 +756,19 @@ func PushCommands(
 	conn Conn,
 	adv *packp.AdvRefs,
 	commands []PushCommand,
+	maxRefUpdates int,
 	verbose bool,
 	onRejection func(plumbing.ReferenceName, string),
 ) error {
-	for _, batch := range chunkRefUpdates(commands) {
-		if err := pushCommandsBatch(ctx, conn, adv, batch, verbose, onRejection); err != nil {
+	batches := chunkRefUpdates(commands, effectiveMaxRefUpdates(maxRefUpdates))
+	for i, batch := range batches {
+		// Ref-only batches carry no useful target progress; suppress the empty
+		// sideband (verbose=false) and report completion ourselves so a large
+		// push doesn't spew a bare "target:" line per batch.
+		if err := pushCommandsBatch(ctx, conn, adv, batch, false, onRejection); err != nil {
 			return err
 		}
+		logRefUpdateBatch(conn, verbose, i+1, len(batches), len(batch))
 	}
 	return nil
 }

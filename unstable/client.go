@@ -41,6 +41,7 @@ type AdvancedOptions struct {
 	Progress               bool   `json:"progress"`
 	MaxPackBytes           int64  `json:"maxPackBytes"`
 	TargetMaxPackBytes     int64  `json:"targetMaxPackBytes"`
+	TargetMaxRefUpdates    int    `json:"targetMaxRefUpdates"`
 	MaterializedMaxObjects int    `json:"materializedMaxObjects"`
 	BootstrapStrategy      string `json:"bootstrapStrategy,omitempty"`
 }
@@ -279,6 +280,7 @@ func (c *Client) buildSyncConfig(ctx context.Context, req SyncRequest) (syncer.C
 		BestEffort:             req.Policy.BestEffort,
 		MaxPackBytes:           req.Options.MaxPackBytes,
 		TargetMaxPackBytes:     req.Options.TargetMaxPackBytes,
+		TargetMaxRefUpdates:    req.Options.TargetMaxRefUpdates,
 		MaterializedMaxObjects: maxObjects,
 		ProtocolMode:           protocolString(req.Policy.Protocol),
 		Verbose:                req.Options.Verbose,
@@ -308,9 +310,10 @@ func (c *Client) buildBootstrapConfig(ctx context.Context, req BootstrapRequest)
 		ShowStats:          req.Options.CollectStats,
 		MeasureMemory:      req.Options.MeasureMemory,
 		Progress:           req.Options.Progress,
-		MaxPackBytes:       req.Options.MaxPackBytes,
-		TargetMaxPackBytes: req.Options.TargetMaxPackBytes,
-		ProtocolMode:       protocolString(req.Protocol),
+		MaxPackBytes:        req.Options.MaxPackBytes,
+		TargetMaxPackBytes:  req.Options.TargetMaxPackBytes,
+		TargetMaxRefUpdates: req.Options.TargetMaxRefUpdates,
+		ProtocolMode:        protocolString(req.Protocol),
 		Verbose:            req.Options.Verbose,
 		BootstrapStrategy:  req.Options.BootstrapStrategy,
 	}, nil
