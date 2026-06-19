@@ -43,6 +43,12 @@ func LookupRemoteHelper(scheme string) (string, bool) {
 // no native transport for (e.g. entire://) by delegating auth and the actual
 // network I/O to the helper, while still running the wire protocol itself.
 //
+// It assumes the helper supports stateless-connect (the modern v2 bridge) for
+// both upload-pack and receive-pack — it issues stateless-connect directly
+// rather than negotiating via the capabilities handshake, and treats a
+// "fallback" reply as an error. git-remote-entire satisfies this; a helper that
+// only offers the legacy `connect` capability is not supported.
+//
 // Each Conn operation spawns its own helper process and tears it down when the
 // operation completes. This is deliberate, not lazy: the helper services
 // exactly one stateless-connect session per process (its protocol loop returns
@@ -93,12 +99,10 @@ func (c *HelperConn) RequestInfoRefs(ctx context.Context, service string, gitPro
 		return nil, err
 	}
 	adv, readErr := readAdvertisement(proc.out)
-	finishErr := proc.finish()
-	if readErr != nil {
-		return nil, fmt.Errorf("%s advertisement: %w", service, errors.Join(readErr, finishErr))
-	}
-	if finishErr != nil {
-		return nil, fmt.Errorf("%s advertisement: %w", service, finishErr)
+	// errors.Join drops nils, so this covers the readErr-only, finishErr-only,
+	// and both-set cases in one branch.
+	if err := errors.Join(readErr, proc.finish()); err != nil {
+		return nil, fmt.Errorf("%s advertisement: %w", service, err)
 	}
 	return adv, nil
 }
@@ -194,8 +198,8 @@ type helperProcess struct {
 }
 
 // readAck consumes the helper's stateless-connect response line: an empty line
-// means the connection is established, "fallback" means it can't speak the
-// smart protocol, and anything else is an error (with captured stderr).
+// means the connection is established, "fallback" means it can't proxy this
+// service, and anything else is an error (with captured stderr).
 func (p *helperProcess) readAck() error {
 	line, err := p.out.ReadString('\n')
 	if err != nil {
@@ -233,11 +237,7 @@ func (p *helperProcess) wait() error {
 func (p *helperProcess) finish() error {
 	closeErr := p.closeStdin()
 	_, _ = io.Copy(io.Discard, p.out) //nolint:errcheck // best-effort drain before Wait; exit status is authoritative
-	waitErr := p.wait()
-	if closeErr != nil && !errors.Is(closeErr, os.ErrClosed) {
-		return errors.Join(closeErr, waitErr)
-	}
-	return waitErr
+	return errors.Join(closeErr, p.wait())
 }
 
 // cleanup force-tears-down the process on an error path.
@@ -253,33 +253,17 @@ func (p *helperProcess) cleanup() error {
 // it as the section terminator.
 func readAdvertisement(br *bufio.Reader) ([]byte, error) {
 	var buf bytes.Buffer
-	var header [4]byte
+	var scratch []byte
 	for {
-		if _, err := io.ReadFull(br, header[:]); err != nil {
+		kind, frame, err := readRawPktLine(br, scratch)
+		if err != nil {
 			return nil, fmt.Errorf("read advertisement pkt-line: %w", err)
 		}
-		buf.Write(header[:])
-		switch string(header[:]) {
-		case "0000":
+		buf.Write(frame)
+		scratch = frame // reuse the (possibly grown) backing buffer next iteration
+		if kind == PacketFlush {
 			return buf.Bytes(), nil
-		case "0001", "0002":
-			continue
 		}
-		n, err := parseHexLength(header)
-		if err != nil {
-			return nil, fmt.Errorf("advertisement pkt-line: %w", err)
-		}
-		if n < 4 {
-			return nil, fmt.Errorf("advertisement pkt-line: invalid length %d", n)
-		}
-		if n == 4 {
-			continue
-		}
-		payload := make([]byte, n-4)
-		if _, err := io.ReadFull(br, payload); err != nil {
-			return nil, fmt.Errorf("read advertisement payload: %w", err)
-		}
-		buf.Write(payload)
 	}
 }
 
@@ -287,10 +271,12 @@ func readAdvertisement(br *bufio.Reader) ([]byte, error) {
 // io.EOF when it reaches the stateless-connect response-end (0002) packet. The
 // 0002 is consumed but never forwarded, so the downstream protocol parser sees
 // exactly the same bytes it would from an HTTP response body (which ends at the
-// connection's EOF instead).
+// connection's EOF instead). The frame buffer is reused across packets, so
+// relaying a multi-GB pack costs no per-packet allocation.
 type responseEndReader struct {
 	src     *bufio.Reader
-	pending []byte
+	buf     []byte // reused backing for the current frame
+	pending []byte // unread bytes of the current frame (sub-slice of buf)
 	done    bool
 }
 
@@ -313,33 +299,16 @@ func (r *responseEndReader) Read(p []byte) (int, error) {
 }
 
 func (r *responseEndReader) fill() error {
-	var header [4]byte
-	if _, err := io.ReadFull(r.src, header[:]); err != nil {
+	kind, frame, err := readRawPktLine(r.src, r.buf)
+	if err != nil {
 		return fmt.Errorf("read response pkt-line: %w", err)
 	}
-	switch string(header[:]) {
-	case "0002":
+	if kind == PacketResponseEnd {
 		r.done = true
 		return io.EOF
-	case "0000", "0001":
-		r.pending = append([]byte(nil), header[:]...)
-		return nil
 	}
-	n, err := parseHexLength(header)
-	if err != nil {
-		return fmt.Errorf("response pkt-line: %w", err)
-	}
-	if n < 4 {
-		return fmt.Errorf("response pkt-line: invalid length %d", n)
-	}
-	buf := make([]byte, n)
-	copy(buf, header[:])
-	if n > 4 {
-		if _, err := io.ReadFull(r.src, buf[4:]); err != nil {
-			return fmt.Errorf("read response payload: %w", err)
-		}
-	}
-	r.pending = buf
+	r.buf = frame // retain the grown backing for the next fill
+	r.pending = frame
 	return nil
 }
 
