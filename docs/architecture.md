@@ -104,7 +104,8 @@ The current transfer modes are:
 - `internal/validation`
   - input normalization and front-loaded validation
 - `internal/auth`
-  - credential lookup, Entire token handling, token store behavior
+  - explicit token/bearer auth and git credential-helper integration
+    (lookup deferred until the server returns 401)
 - `internal/strategy/bootstrap`
   - one-shot relay bootstrap and batched bootstrap
 - `internal/strategy/incremental`

@@ -945,15 +945,12 @@ func openSource(ctx context.Context, req Request, planCfg planner.PlanConfig) (g
 	if ep.Scheme != "http" && ep.Scheme != "https" {
 		return nil, nil, nil, fmt.Errorf("convert-sha256 currently supports HTTP/HTTPS sources only; got %q", ep.Scheme)
 	}
-	authMethod, err := auth.Resolve(auth.Endpoint{
+	authMethod := auth.Resolve(auth.Endpoint{
 		Username:      req.SourceAuth.Username,
 		Token:         req.SourceAuth.Token,
 		BearerToken:   req.SourceAuth.BearerToken,
 		SkipTLSVerify: req.SourceAuth.SkipTLSVerify,
 	}, ep)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("resolve source auth: %w", err)
-	}
 	httpClient := &http.Client{Transport: gitproto.NewHTTPTransport(req.SourceAuth.SkipTLSVerify)}
 	conn := gitproto.NewHTTPConnWithClient(ep, "source", normalizeAuth(authMethod), httpClient)
 	conn.FollowInfoRefsRedirect = req.SourceFollowInfoRefsRedirect

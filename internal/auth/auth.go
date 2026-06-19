@@ -28,22 +28,13 @@ type Endpoint struct {
 	SkipTLSVerify bool
 }
 
-// Resolve resolves the auth method for the given endpoint configuration.
-// Order: explicit flags → Entire DB token → anonymous (with the git credential
-// helper deferred until the server returns 401, matching git's own behaviour).
-func Resolve(raw Endpoint, ep *url.URL) (Method, error) {
-	if auth := explicitAuth(raw); auth != nil {
-		return auth, nil
-	}
-	if !isHTTPEndpoint(ep) {
-		return nil, nil //nolint:nilnil // nil signals no auth method found at this stage
-	}
-	if username, password, ok, err := LookupEntireDBCredential(raw, ep); err != nil {
-		return nil, err // issue #7: surface refresh failure explicitly
-	} else if ok {
-		return &transporthttp.BasicAuth{Username: username, Password: password}, nil
-	}
-	return nil, nil //nolint:nilnil // nil signals no auth method found at this stage
+// Resolve resolves the auth method for the given endpoint configuration:
+// explicit token/bearer flags, or nil to proceed anonymously (the git
+// credential helper is consulted later, deferred until the server returns 401,
+// matching git's own behaviour). The endpoint is unused now but kept in the
+// signature so callers needn't special-case it.
+func Resolve(raw Endpoint, _ *url.URL) Method {
+	return explicitAuth(raw)
 }
 
 func explicitAuth(raw Endpoint) Method {
