@@ -355,6 +355,12 @@ func newConn(raw Endpoint, label string, stats *statsCollector, httpClient *http
 	if err != nil {
 		return nil, fmt.Errorf("parse endpoint: %w", err)
 	}
+	// Dispatch on scheme: ssh has a native transport; http/https fall through
+	// to the HTTP builder below. Any other scheme (e.g. entire://) is handed to
+	// a git remote helper named git-remote-<scheme> if one is installed — the
+	// helper owns auth and the network round trips while git-sync drives the
+	// smart protocol over its stateless-connect bridge. http/https deliberately
+	// stay on the native transport rather than git's own git-remote-http(s).
 	switch ep.Scheme {
 	case "ssh", "git+ssh":
 		stats.setSideDisplay(label, hostnameFromURL(raw.URL))
@@ -363,6 +369,15 @@ func newConn(raw Endpoint, label string, stats *statsCollector, httpClient *http
 			return nil, fmt.Errorf("new SSH connection: %w", err)
 		}
 		return conn, nil
+	case "http", "https":
+		// native HTTP transport, built below
+	default:
+		if helperPath, ok := gitproto.LookupRemoteHelper(ep.Scheme); ok {
+			stats.setSideDisplay(label, hostnameFromURL(raw.URL))
+			return gitproto.NewHelperConn(helperPath, ep, raw.URL, label), nil
+		}
+		// No helper: fall through to the HTTP builder, preserving the prior
+		// behavior of surfacing an unsupported-scheme error from there.
 	}
 	authEp := auth.Endpoint{
 		Username:      raw.Username,

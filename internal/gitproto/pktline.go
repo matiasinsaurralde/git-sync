@@ -80,6 +80,54 @@ func (pr *PacketReader) ReadPacket() (PacketType, []byte, error) {
 	return PacketData, pr.buf, nil
 }
 
+// readRawPktLine reads one pkt-line and returns its type plus the verbatim
+// on-wire bytes — the 4-byte length header followed by any payload — so callers
+// that must relay or accumulate the exact wire framing (unlike ReadPacket,
+// which yields only the payload) can do so. scratch is reused as backing
+// storage and grown as needed; pass the slice returned by the previous call to
+// avoid per-packet allocation. The returned slice aliases scratch and is valid
+// only until the next call.
+func readRawPktLine(br *bufio.Reader, scratch []byte) (PacketType, []byte, error) {
+	if cap(scratch) < 4 {
+		scratch = make([]byte, 4)
+	}
+	frame := scratch[:4]
+	if _, err := io.ReadFull(br, frame); err != nil {
+		return PacketData, nil, fmt.Errorf("read pktline header: %w", err)
+	}
+	switch string(frame) {
+	case "0000":
+		return PacketFlush, frame, nil
+	case "0001":
+		return PacketDelim, frame, nil
+	case "0002":
+		return PacketResponseEnd, frame, nil
+	}
+
+	var header [4]byte
+	copy(header[:], frame)
+	n, err := parseHexLength(header)
+	if err != nil {
+		return PacketData, nil, err
+	}
+	if n < 4 || n > pktline.MaxSize {
+		return PacketData, nil, pktline.ErrInvalidPktLen
+	}
+	if n > cap(scratch) {
+		grown := make([]byte, n)
+		copy(grown, frame)
+		scratch = grown
+	} else {
+		scratch = scratch[:n]
+	}
+	if n > 4 {
+		if _, err := io.ReadFull(br, scratch[4:n]); err != nil {
+			return PacketData, nil, fmt.Errorf("read pktline payload: %w", err)
+		}
+	}
+	return PacketData, scratch[:n], nil
+}
+
 func parseHexLength(header [4]byte) (int, error) {
 	var n int
 	for _, b := range header {
