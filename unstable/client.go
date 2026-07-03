@@ -233,7 +233,7 @@ func (c *Client) buildProbeConfig(ctx context.Context, req ProbeRequest) (syncer
 		ShowStats:          req.Options.CollectStats,
 		MeasureMemory:      req.Options.MeasureMemory,
 		Progress:           req.Options.Progress,
-		ProtocolMode:       protocolString(req.Protocol),
+		ProtocolMode:       string(req.Protocol),
 		Verbose:            req.Options.Verbose,
 	}
 	if req.Target != nil {
@@ -272,7 +272,7 @@ func (c *Client) buildSyncConfig(ctx context.Context, req SyncRequest) (syncer.C
 		ShowStats:              req.Options.CollectStats,
 		MeasureMemory:          req.Options.MeasureMemory,
 		Progress:               req.Options.Progress,
-		Mode:                   operationModeString(req.Policy.Mode),
+		Mode:                   string(req.Policy.Mode),
 		ForceWithLease:         req.Policy.ForceWithLease,
 		ForceBlind:             req.Policy.ForceBlind,
 		Prune:                  req.Policy.Prune,
@@ -281,7 +281,7 @@ func (c *Client) buildSyncConfig(ctx context.Context, req SyncRequest) (syncer.C
 		TargetMaxPackBytes:     req.Options.TargetMaxPackBytes,
 		TargetMaxRefUpdates:    req.Options.TargetMaxRefUpdates,
 		MaterializedMaxObjects: maxObjects,
-		ProtocolMode:           protocolString(req.Policy.Protocol),
+		ProtocolMode:           string(req.Policy.Protocol),
 		Verbose:                req.Options.Verbose,
 		BootstrapStrategy:      req.Options.BootstrapStrategy,
 	}, nil
@@ -312,7 +312,7 @@ func (c *Client) buildBootstrapConfig(ctx context.Context, req BootstrapRequest)
 		MaxPackBytes:        req.Options.MaxPackBytes,
 		TargetMaxPackBytes:  req.Options.TargetMaxPackBytes,
 		TargetMaxRefUpdates: req.Options.TargetMaxRefUpdates,
-		ProtocolMode:        protocolString(req.Protocol),
+		ProtocolMode:        string(req.Protocol),
 		Verbose:             req.Options.Verbose,
 		BootstrapStrategy:   req.Options.BootstrapStrategy,
 	}, nil
@@ -334,7 +334,7 @@ func (c *Client) buildFetchConfig(ctx context.Context, req FetchRequest) (syncer
 		ShowStats:          req.Options.CollectStats,
 		MeasureMemory:      req.Options.MeasureMemory,
 		Progress:           req.Options.Progress,
-		ProtocolMode:       protocolString(req.Protocol),
+		ProtocolMode:       string(req.Protocol),
 		Verbose:            req.Options.Verbose,
 	}, nil
 }
@@ -356,20 +356,6 @@ func (c *Client) resolveEndpoint(ctx context.Context, endpoint gitsync.Endpoint,
 		return syncer.Endpoint{}, err
 	}
 	return syncerEndpoint(endpoint, auth), nil
-}
-
-func protocolString(mode gitsync.ProtocolMode) string {
-	if mode == "" {
-		return string(gitsync.ProtocolAuto)
-	}
-	return string(mode)
-}
-
-func operationModeString(mode gitsync.OperationMode) string {
-	if mode == "" {
-		return string(gitsync.ModeSync)
-	}
-	return string(mode)
 }
 
 func syncerEndpoint(endpoint gitsync.Endpoint, auth gitsync.EndpointAuth) syncer.Endpoint {

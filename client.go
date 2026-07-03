@@ -93,7 +93,7 @@ func (c *Client) buildProbeConfig(ctx context.Context, req ProbeRequest) (syncer
 		AllRefs:            req.AllRefs,
 		ExcludeRefPrefixes: append([]string(nil), req.ExcludeRefPrefixes...),
 		ShowStats:          req.CollectStats,
-		ProtocolMode:       protocolString(req.Protocol),
+		ProtocolMode:       string(req.Protocol),
 	}
 	if req.Target != nil {
 		targetAuth, err := c.authFor(ctx, *req.Target, TargetRole)
@@ -126,12 +126,12 @@ func (c *Client) buildSyncConfig(ctx context.Context, req SyncRequest, dryRun bo
 		IncludeTags:            req.Policy.IncludeTags,
 		DryRun:                 dryRun,
 		ShowStats:              req.CollectStats,
-		Mode:                   operationModeString(req.Policy.Mode),
+		Mode:                   string(req.Policy.Mode),
 		ForceWithLease:         req.Policy.ForceWithLease,
 		ForceBlind:             req.Policy.ForceBlind,
 		Prune:                  req.Policy.Prune,
 		BestEffort:             req.Policy.BestEffort,
-		ProtocolMode:           protocolString(req.Policy.Protocol),
+		ProtocolMode:           string(req.Policy.Protocol),
 		MaterializedMaxObjects: syncer.DefaultMaterializedMaxObjects,
 	}, nil
 }
@@ -201,20 +201,6 @@ func syncerEndpoint(ep Endpoint, auth EndpointAuth) syncer.Endpoint {
 		SkipTLSVerify:          auth.SkipTLSVerify,
 		FollowInfoRefsRedirect: ep.FollowInfoRefsRedirect,
 	}
-}
-
-func protocolString(mode ProtocolMode) string {
-	if mode == "" {
-		return string(ProtocolAuto)
-	}
-	return string(mode)
-}
-
-func operationModeString(mode OperationMode) string {
-	if mode == "" {
-		return string(ModeSync)
-	}
-	return string(mode)
 }
 
 func validateOperationMode(mode OperationMode) error {
