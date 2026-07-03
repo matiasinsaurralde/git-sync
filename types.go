@@ -91,6 +91,11 @@ type RefScope struct {
 	Mappings           []RefMapping `json:"mappings"`
 	AllRefs            bool         `json:"allRefs,omitempty"`
 	ExcludeRefPrefixes []string     `json:"excludeRefPrefixes,omitempty"`
+	// ExcludeRefs subtracts exact ref names from auto-discovery: matched
+	// whole (not by prefix), so a caller can reserve a directory-anchor name
+	// like refs/heads/entire without also excluding its children
+	// (refs/heads/entire/foo). Not applied to explicit Mappings.
+	ExcludeRefs []string `json:"excludeRefs,omitempty"`
 }
 
 // SyncPolicy controls high-level sync behavior. BestEffort downgrades per-ref

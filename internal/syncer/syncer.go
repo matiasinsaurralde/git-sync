@@ -72,6 +72,7 @@ type Config struct {
 	Mappings               []RefMapping
 	AllRefs                bool
 	ExcludeRefPrefixes     []string
+	ExcludeRefs            []string
 	IncludeTags            bool
 	DryRun                 bool
 	Verbose                bool
@@ -518,6 +519,7 @@ func planConfig(cfg Config) planner.PlanConfig {
 		IncludeTags:        cfg.IncludeTags,
 		AllRefs:            cfg.AllRefs,
 		ExcludeRefPrefixes: cfg.ExcludeRefPrefixes,
+		ExcludeRefs:        cfg.ExcludeRefs,
 		Force:              cfg.ForceAny(),
 		Prune:              cfg.Prune,
 	}
@@ -1044,7 +1046,7 @@ func (s *syncSession) replicateCanBootstrap(desiredRefs map[plumbing.ReferenceNa
 		if _, ok := desiredRefs[targetRef]; ok {
 			continue
 		}
-		if planner.IsRefExcluded(targetRef, s.cfg.ExcludeRefPrefixes) {
+		if planner.IsRefExcluded(targetRef, s.cfg.ExcludeRefPrefixes, s.cfg.ExcludeRefs) {
 			continue
 		}
 		// AllRefs overrides per-namespace allowlists: under "all refs" a
@@ -1266,7 +1268,7 @@ func (s *syncSession) buildHaveRefMap(haveRefs []string, haveHashes []plumbing.H
 func (s *syncSession) newProbeResult() ProbeResult {
 	refInfos := make([]RefInfo, 0, len(s.sourceRefMap))
 	for name, hash := range s.sourceRefMap {
-		if planner.IsRefExcluded(name, s.cfg.ExcludeRefPrefixes) {
+		if planner.IsRefExcluded(name, s.cfg.ExcludeRefPrefixes, s.cfg.ExcludeRefs) {
 			continue
 		}
 		refInfos = append(refInfos, RefInfo{Name: name.String(), Hash: hash})

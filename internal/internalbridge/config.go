@@ -44,6 +44,7 @@ type RefScope struct {
 	Mappings           []RefMapping
 	AllRefs            bool
 	ExcludeRefPrefixes []string
+	ExcludeRefs        []string
 }
 
 type SyncPolicy struct {
@@ -81,6 +82,7 @@ func SyncConfig(source Endpoint, sourceAuth EndpointAuth, target Endpoint, targe
 		Mappings:               ToValidationMappings(scope.Mappings),
 		AllRefs:                scope.AllRefs,
 		ExcludeRefPrefixes:     append([]string(nil), scope.ExcludeRefPrefixes...),
+		ExcludeRefs:            append([]string(nil), scope.ExcludeRefs...),
 		IncludeTags:            policy.IncludeTags,
 		DryRun:                 dryRun,
 		ShowStats:              collectStats,

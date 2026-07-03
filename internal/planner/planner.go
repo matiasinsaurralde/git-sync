@@ -28,6 +28,11 @@ type PlanConfig struct {
 	// whose name starts with any of these prefixes is not pulled, pushed,
 	// or pruned. Explicit Mappings are not subject to this filter.
 	ExcludeRefPrefixes []string
+	// ExcludeRefs subtracts exact ref names (whole-name match) from
+	// auto-discovery, same effect as ExcludeRefPrefixes but without matching
+	// children — so a caller can reserve refs/heads/entire while still
+	// mirroring refs/heads/entire/foo. Explicit Mappings are not subject to it.
+	ExcludeRefs []string
 }
 
 // BuildDesiredRefs constructs the set of desired refs and managed targets from
@@ -78,7 +83,7 @@ func BuildDesiredRefs(
 		selected := SelectBranches(branches, cfg.Branches)
 		for branch, hash := range selected {
 			refName := plumbing.NewBranchReferenceName(branch)
-			if IsRefExcluded(refName, cfg.ExcludeRefPrefixes) {
+			if IsRefExcluded(refName, cfg.ExcludeRefPrefixes, cfg.ExcludeRefs) {
 				continue
 			}
 			if err := addManaged(refName, refName, RefKindBranch, hash); err != nil {
@@ -100,7 +105,7 @@ func BuildDesiredRefs(
 			default:
 				continue
 			}
-			if IsRefExcluded(refName, cfg.ExcludeRefPrefixes) {
+			if IsRefExcluded(refName, cfg.ExcludeRefPrefixes, cfg.ExcludeRefs) {
 				continue
 			}
 			if _, ok := desired[refName]; ok {
@@ -252,7 +257,7 @@ func addPruneCandidates(managed map[plumbing.ReferenceName]ManagedTarget, target
 		if _, ok := managed[targetRef]; ok {
 			continue
 		}
-		if IsRefExcluded(targetRef, cfg.ExcludeRefPrefixes) {
+		if IsRefExcluded(targetRef, cfg.ExcludeRefPrefixes, cfg.ExcludeRefs) {
 			continue
 		}
 		switch {
