@@ -42,7 +42,6 @@ import (
 	formatcfg "github.com/go-git/go-git/v6/plumbing/format/config"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/storer"
-	transporthttp "github.com/go-git/go-git/v6/plumbing/transport/http"
 	"github.com/go-git/go-git/v6/storage/filesystem"
 
 	gitsync "entire.io/entire/git-sync"
@@ -952,7 +951,7 @@ func openSource(ctx context.Context, req Request, planCfg planner.PlanConfig) (g
 		SkipTLSVerify: req.SourceAuth.SkipTLSVerify,
 	}, ep)
 	httpClient := &http.Client{Transport: gitproto.NewHTTPTransport(req.SourceAuth.SkipTLSVerify)}
-	conn := gitproto.NewHTTPConnWithClient(ep, "source", normalizeAuth(authMethod), httpClient)
+	conn := gitproto.NewHTTPConnWithClient(ep, "source", authMethod, httpClient)
 	conn.FollowInfoRefsRedirect = req.SourceFollowInfoRefsRedirect
 
 	mode := string(req.ProtocolMode)
@@ -966,30 +965,6 @@ func openSource(ctx context.Context, req Request, planCfg planner.PlanConfig) (g
 		return nil, nil, nil, fmt.Errorf("list source refs: %w", err)
 	}
 	return conn, svc, refs, nil
-}
-
-func normalizeAuth(m auth.Method) gitproto.AuthMethod {
-	if m == nil {
-		return nil
-	}
-	// auth.Method and gitproto.AuthMethod share the same Authorizer signature.
-	// Wrap so we can pass either *transporthttp.BasicAuth or *transporthttp.TokenAuth.
-	if a, ok := m.(*transporthttp.BasicAuth); ok {
-		return a
-	}
-	if a, ok := m.(*transporthttp.TokenAuth); ok {
-		return a
-	}
-	return authAdapter{m: m}
-}
-
-type authAdapter struct{ m auth.Method }
-
-func (a authAdapter) Authorizer(req *http.Request) error {
-	if err := a.m.Authorizer(req); err != nil {
-		return fmt.Errorf("authorize request: %w", err)
-	}
-	return nil
 }
 
 // translator walks the SHA1 source store, rewrites object content with

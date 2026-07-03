@@ -4,33 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-
-	"github.com/go-git/go-git/v6/plumbing"
 )
-
-// ToPushCommands converts a slice of PushPlans to PushCommands.
-// Used by all strategy packages to avoid copy-pasting the conversion.
-func ToPushCommands(plans []PushPlan) []PushCommand {
-	cmds := make([]PushCommand, 0, len(plans))
-	for _, p := range plans {
-		cmd := PushCommand{Name: p.TargetRef, Old: p.TargetHash}
-		if p.Delete {
-			cmd.Delete = true
-		} else {
-			cmd.New = p.SourceHash
-		}
-		cmds = append(cmds, cmd)
-	}
-	return cmds
-}
-
-// PushPlan is a minimal interface for plan-to-command conversion.
-type PushPlan struct {
-	TargetRef  plumbing.ReferenceName
-	TargetHash plumbing.Hash
-	SourceHash plumbing.Hash
-	Delete     bool
-}
 
 // LimitPackReader wraps a ReadCloser with a byte limit. Shared across strategies.
 func LimitPackReader(r io.ReadCloser, maxBytes int64) io.ReadCloser {

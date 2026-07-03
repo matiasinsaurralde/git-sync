@@ -1289,8 +1289,6 @@ func (s *syncSession) newProbeResult() ProbeResult {
 	if s.target != nil {
 		result.TargetURL = s.cfg.Target.URL
 		result.TargetCaps = gitproto.AdvRefsCaps(s.target.adv)
-		result.Stats = s.stats.snapshot()
-		result.Measurement = s.measurementDone()
 	}
 	return result
 }

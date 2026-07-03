@@ -822,16 +822,6 @@ func emptyPack(adv *packp.AdvRefs) []byte {
 	return emptyPackSHA1
 }
 
-func progressWriter(verbose bool, dest io.Writer) io.Writer {
-	if !verbose {
-		return nil
-	}
-	if dest == nil {
-		dest = os.Stderr
-	}
-	return dest
-}
-
 // progressSink returns a line-prefixing io.Writer suitable for
 // sideband.Demuxer.Progress. When verbose is false it returns nil so the
 // demuxer discards progress frames without allocating. Passing a non-nil
