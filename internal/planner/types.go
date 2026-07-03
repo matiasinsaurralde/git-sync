@@ -105,8 +105,8 @@ func ShortHash(hash plumbing.Hash) string {
 // IsRefExcluded reports whether name matches any of the exclude prefixes.
 // Empty prefixes are ignored. Used to subtract specific namespaces from
 // auto-discovery (e.g. refs/pull/* under --all-refs against GitHub).
-func IsRefExcluded(name plumbing.ReferenceName, excludePrefixes []string) bool {
-	if len(excludePrefixes) == 0 {
+func IsRefExcluded(name plumbing.ReferenceName, excludePrefixes, excludeExact []string) bool {
+	if len(excludePrefixes) == 0 && len(excludeExact) == 0 {
 		return false
 	}
 	s := name.String()
@@ -116,6 +116,14 @@ func IsRefExcluded(name plumbing.ReferenceName, excludePrefixes []string) bool {
 			continue
 		}
 		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	// Exact names match the whole ref, so a caller can reserve
+	// refs/heads/entire without also excluding refs/heads/entire/foo — which
+	// a prefix cannot express (it would also catch refs/heads/entirely).
+	for _, e := range excludeExact {
+		if e = strings.TrimSpace(e); e != "" && s == e {
 			return true
 		}
 	}

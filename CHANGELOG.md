@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `RefScope.ExcludeRefs` — exact ref-name exclusion, alongside the existing prefix-based `ExcludeRefPrefixes`. An excluded exact name is not pulled, pushed, or pruned, but — unlike a prefix — its children are unaffected, so a caller can reserve a directory-anchor ref like `refs/heads/entire` while still mirroring `refs/heads/entire/foo`. Threaded through `RefScope` → planner `PlanConfig`; `IsRefExcluded` now takes both prefix and exact lists.
+
 ### Removed
 
 - The built-in Entire DB credential store integration (`hosts.json` active-user lookup, the file/keyring token store, and OAuth refresh-token handling). `auth.Resolve` now resolves only explicit token/bearer credentials; everything else defers to the git credential helper on a 401, exactly as for any other remote. The Entire mirroring pipeline and the `git-remote-entire` helper already supply credentials directly (installation / repo-scoped tokens at the transport layer), so nothing produced the `hosts.json`/token-store layout this code read. This drops the `github.com/zalando/go-keyring` dependency and, with the file token store gone, the package now compiles on Windows without a `flock` shim.

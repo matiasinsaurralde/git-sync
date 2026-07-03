@@ -217,6 +217,7 @@ func bridgeScope(scope RefScope) internalbridge.RefScope {
 		Mappings:           mappings,
 		AllRefs:            scope.AllRefs,
 		ExcludeRefPrefixes: append([]string(nil), scope.ExcludeRefPrefixes...),
+		ExcludeRefs:        append([]string(nil), scope.ExcludeRefs...),
 	}
 }
 
