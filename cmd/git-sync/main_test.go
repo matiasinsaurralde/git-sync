@@ -24,6 +24,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/format/pktline"
 	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v6/plumbing/protocol"
 	"github.com/go-git/go-git/v6/plumbing/protocol/capability"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp/sideband"
@@ -46,6 +47,7 @@ import (
 // Tests that need to exercise helper behaviour explicitly should
 // restore auth.GitCredentialCommand in their own setup.
 func TestMain(m *testing.M) {
+	syncertest.IsolateGitConfig()
 	auth.GitCredentialCommand = func(_ context.Context, _ auth.CredentialOp, _ string) ([]byte, error) {
 		return nil, errors.New("no helper configured (test default)")
 	}
@@ -811,7 +813,7 @@ func (s *smartHTTPRepoServer) handleInfoRefs(w http.ResponseWriter, r *http.Requ
 	}
 
 	var buf bytes.Buffer
-	if err := transport.AdvertiseRefs(r.Context(), s.repo.Storer, &buf, service, false); err != nil {
+	if err := transport.AdvertiseRefs(r.Context(), s.repo.Storer, &buf, service, false, protocol.V0); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

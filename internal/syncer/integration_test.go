@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -24,14 +25,13 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/format/packfile"
 	"github.com/go-git/go-git/v6/plumbing/format/pktline"
 	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v6/plumbing/protocol"
 	"github.com/go-git/go-git/v6/plumbing/protocol/capability"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp/sideband"
 	"github.com/go-git/go-git/v6/plumbing/revlist"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage/memory"
-	"github.com/go-git/go-git/v6/x/plugin"
-	"github.com/go-git/go-git/v6/x/plugin/config"
 )
 
 const (
@@ -3773,7 +3773,7 @@ func (s *smartHTTPRepoServer) handleInfoRefs(w http.ResponseWriter, r *http.Requ
 	}
 
 	var buf bytes.Buffer
-	if err := transport.AdvertiseRefs(r.Context(), s.repo.Storer, &buf, service, false); err != nil {
+	if err := transport.AdvertiseRefs(r.Context(), s.repo.Storer, &buf, service, false, protocol.V0); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -4289,13 +4289,10 @@ func decodeV2TestCommandRequest(body []byte) (v2TestCommandRequest, error) {
 }
 
 func TestMain(m *testing.M) {
-	// Ensures empty config files for system/global so that test execution
-	// is not affected by environmental settings (e.g. commit.gpgSign=true).
-	if err := plugin.Register(plugin.ConfigLoader(), func() plugin.ConfigSource {
-		return config.NewEmpty()
-	}); err != nil {
-		panic("register go-git empty config loader: " + err.Error())
-	}
-
-	m.Run()
+	// Isolate tests from the host's system/global git config (e.g.
+	// commit.gpgSign=true). This covers both go-git and the git binary the
+	// SSH integration tests shell out to, which the go-git-only plugin
+	// override did not.
+	syncertest.IsolateGitConfig()
+	os.Exit(m.Run())
 }
