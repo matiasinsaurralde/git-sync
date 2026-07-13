@@ -24,6 +24,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/format/packfile"
 	"github.com/go-git/go-git/v6/plumbing/format/pktline"
 	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v6/plumbing/protocol"
 	"github.com/go-git/go-git/v6/plumbing/protocol/capability"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp/sideband"
@@ -3773,7 +3774,7 @@ func (s *smartHTTPRepoServer) handleInfoRefs(w http.ResponseWriter, r *http.Requ
 	}
 
 	var buf bytes.Buffer
-	if err := transport.AdvertiseRefs(r.Context(), s.repo.Storer, &buf, service, false); err != nil {
+	if err := transport.AdvertiseRefs(r.Context(), s.repo.Storer, &buf, service, false, protocol.V0); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
