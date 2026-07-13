@@ -47,6 +47,7 @@ import (
 // Tests that need to exercise helper behaviour explicitly should
 // restore auth.GitCredentialCommand in their own setup.
 func TestMain(m *testing.M) {
+	syncertest.IsolateGitConfig()
 	auth.GitCredentialCommand = func(_ context.Context, _ auth.CredentialOp, _ string) ([]byte, error) {
 		return nil, errors.New("no helper configured (test default)")
 	}

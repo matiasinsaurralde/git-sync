@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 
 	git "github.com/go-git/go-git/v6"
@@ -18,6 +19,11 @@ import (
 
 	"entire.io/entire/git-sync/internal/syncertest"
 )
+
+func TestMain(m *testing.M) {
+	syncertest.IsolateGitConfig()
+	os.Exit(m.Run())
+}
 
 type errAuthProvider struct{}
 

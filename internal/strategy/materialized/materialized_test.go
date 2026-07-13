@@ -2,6 +2,7 @@ package materialized
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/go-git/go-git/v6/plumbing"
@@ -12,6 +13,11 @@ import (
 	"entire.io/entire/git-sync/internal/planner"
 	"entire.io/entire/git-sync/internal/syncertest"
 )
+
+func TestMain(m *testing.M) {
+	syncertest.IsolateGitConfig()
+	os.Exit(m.Run())
+}
 
 func TestDefaultMaxMaterializedObjectsExported(t *testing.T) {
 	// Verify the constant is exported and has a reasonable positive value.

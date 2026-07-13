@@ -3,6 +3,7 @@ package syncertest
 import (
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,20 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/storage/memory"
 )
+
+// IsolateGitConfig makes the current process ignore the host's global and
+// system git configuration for the lifetime of the test binary, so developer
+// settings such as commit.gpgSign=true do not leak into tests.
+//
+// Both go-git (via its default NewAuto ConfigLoader plugin) and the git binary
+// honour GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM; pointing them at os.DevNull
+// yields empty global/system config. Call this from TestMain before m.Run().
+// It uses os.Setenv rather than testing.T.Setenv because the suites run tests
+// in parallel, which forbids per-test Setenv.
+func IsolateGitConfig() {
+	_ = os.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	_ = os.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
+}
 
 // SetRefAtBranch points an arbitrary ref (e.g. refs/notes/commits) at the
 // current tip of branch and returns the resolved hash. Used by --all-refs
